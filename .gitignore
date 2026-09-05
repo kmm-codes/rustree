@@ -1,1 +1,7 @@
 /target
+
+# Local release artifacts (scripts/release.ps1)
+/release
+
+# mkdocs build output
+/site
