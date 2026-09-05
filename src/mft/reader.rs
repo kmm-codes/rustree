@@ -15,8 +15,8 @@
 //! 3. Record 0 lesen - er beschreibt die MFT selbst. Sein `$DATA`-Attribut
 //!    listet die Data Runs (die Fragmente der MFT auf der Platte) und ihre
 //!    Gesamtgröße, aus der sich die Anzahl der Records ergibt
-//! 4. Fragment für Fragment in großen Blöcken lesen, jeden Record per Fixup
-//!    korrigieren und parsen
+//! 4. Die MFT in großen Blöcken lesen, jeden Record per Fixup korrigieren
+//!    und parsen
 //!
 //! # Warum ohne Cache lesen?
 //!
@@ -26,6 +26,15 @@
 //! Puffer, dafür müssen Puffer-Adresse, Offset und Länge Vielfache der
 //! Sektorgröße sein ([`AlignedBuffer`]). Für eine MFT von mehreren GB ist
 //! das der Unterschied zwischen zwanzig Sekunden und zwei.
+//!
+//! # Warum mehrere Leser?
+//!
+//! Eine SSD liefert ihre volle Geschwindigkeit nur, wenn mehrere Anfragen
+//! gleichzeitig anstehen. Ein einzelner Thread mit einem Lesebefehl nach dem
+//! anderen lässt sie die halbe Zeit warten. Deshalb lesen mehrere Threads
+//! nebeneinander je einen Block, jeder über ein eigenes Handle (synchrone
+//! Handles bearbeiten nur einen Aufruf zur Zeit), während ein anderer Satz
+//! Blöcke geparst wird.
 
 use super::parser::{attribute_types, DataRun, ExtensionRecord, MftParser, ParsedRecord};
 use super::types::{FileEntry, MftError};
@@ -51,8 +60,14 @@ use windows::{
 
 /// Blockgröße beim Lesen der MFT; wird auf ganze Records gerundet. Groß
 /// genug, dass ein Lesezugriff die Platte auslastet, klein genug für zwei
-/// Puffer im Wechsel.
+/// Sätze Puffer im Wechsel. Per Umgebungsvariable `RUSTREE_CHUNK_MB` zum
+/// Messen übersteuerbar.
 const READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Wie viele Blöcke gleichzeitig vom Laufwerk gelesen werden; per
+/// Umgebungsvariable `RUSTREE_READERS` zum Messen übersteuerbar
+const DEFAULT_PARALLEL_READS: usize = 4;
+const MAX_PARALLEL_READS: usize = 16;
 
 /// Ausrichtung der Lesepuffer: deckt 512-Byte- und 4K-Sektoren ab
 const BUFFER_ALIGNMENT: usize = 4096;
@@ -182,7 +197,8 @@ impl MftReader {
         // die Leselänge ein Vielfaches der Sektorgröße sein: ganze Cluster.
         progress_callback(0.0, "Lese $MFT-Record...");
 
-        let mut first_cluster = AlignedBuffer::new(record_size.div_ceil(bytes_per_cluster) * bytes_per_cluster);
+        let mut first_cluster =
+            AlignedBuffer::new(record_size.div_ceil(bytes_per_cluster) * bytes_per_cluster);
         let read = volume.read_at(
             self.mft_start_cluster * self.bytes_per_cluster,
             first_cluster.as_mut_slice(),
@@ -213,9 +229,25 @@ impl MftReader {
             None => None,
         };
 
-        // Schritt 4: Fragmente nacheinander in großen Blöcken lesen
-        let mut source = VolumeSource::new(&volume, runs, self.bytes_per_cluster, record_size);
-        scan_source(&mut source, record_size, total_records, dump.as_mut(), progress_callback)
+        // Schritt 4: die MFT in großen Blöcken lesen, mehrere gleichzeitig
+        let parallel_reads = std::env::var("RUSTREE_READERS")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(DEFAULT_PARALLEL_READS)
+            .clamp(1, MAX_PARALLEL_READS);
+        let mut volumes = vec![volume];
+        while volumes.len() < parallel_reads {
+            volumes.push(Volume::open(&self.drive_letter, true)?);
+        }
+
+        let source = VolumeSource::new(
+            volumes,
+            &runs,
+            self.bytes_per_cluster,
+            total_records * record_size as u64,
+            record_size,
+        );
+        scan_source(&source, record_size, total_records, dump.as_mut(), progress_callback)
     }
 
     /// Liest eine Dump-Datei aus [`MftReader::scan_with_dump`] statt des
@@ -240,8 +272,12 @@ impl MftReader {
         let total_records = (file.metadata()?.len().saturating_sub(DUMP_HEADER_SIZE as u64))
             / record_size as u64;
 
-        let mut source = FileSource { file, record_size };
-        scan_source(&mut source, record_size, total_records, None, progress_callback)
+        let source = FileSource {
+            file,
+            record_size,
+            stream_len: total_records * record_size as u64,
+        };
+        scan_source(&source, record_size, total_records, None, progress_callback)
     }
 
     /// Legt die Dump-Datei an und schreibt den Kopf
@@ -337,100 +373,158 @@ impl MftReader {
 
 /// Woher die MFT-Records kommen: vom Laufwerk oder aus einer Dump-Datei
 ///
-/// Liefert die MFT als fortlaufenden Bytestrom in Blöcken aus ganzen
-/// Records, unabhängig davon, wie sie auf der Platte verteilt ist.
-/// `Send`, weil der nächste Block auf einem anderen Thread gelesen wird,
-/// während der aktuelle geparst wird.
-trait RecordSource: Send {
-    /// Füllt den Puffer mit dem nächsten Block; 0 bedeutet Ende
-    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError>;
+/// Sieht die MFT als fortlaufenden Bytestrom in Blöcken fester Größe,
+/// unabhängig davon, wie sie auf der Platte verteilt ist. Mehrere Blöcke
+/// dürfen gleichzeitig gelesen werden - jeder Aufrufer bekommt einen
+/// eigenen `slot`, den er allein benutzt.
+trait RecordSource: Sync {
+    /// Wie viele Blöcke gleichzeitig gelesen werden sollen (Anzahl Slots)
+    fn parallelism(&self) -> usize;
+
+    /// Liest Block `block` (Byte `block * buffer.len()` im Strom) in den
+    /// Puffer; Rückgabe: nutzbare Bytes in ganzen Records, 0 am Ende
+    fn read_block(&self, slot: usize, block: usize, buffer: &mut [u8]) -> Result<usize, MftError>;
 }
 
-/// Liest die Fragmente der MFT vom Raw-Volume
+/// Ein Fragment der MFT auf der Platte, mit seiner Lage im Bytestrom
 #[cfg(target_os = "windows")]
-struct VolumeSource<'a> {
-    volume: &'a Volume,
-    runs: Vec<DataRun>,
+#[derive(Debug, Clone, Copy)]
+struct Extent {
+    /// Position im MFT-Strom
+    stream_offset: u64,
+    /// Position auf der Platte; `None` bei sparse (liest sich als Nullen)
+    disk_offset: Option<u64>,
+    len: u64,
+}
+
+/// Liest die Fragmente der MFT vom Raw-Volume, ein Handle pro Slot
+#[cfg(target_os = "windows")]
+struct VolumeSource {
+    volumes: Vec<Volume>,
+    extents: Vec<Extent>,
     bytes_per_cluster: u64,
+    /// Länge des MFT-Stroms in Bytes (ganze Records)
+    stream_len: u64,
     record_size: usize,
-    next_run: usize,
-    /// Nächste Leseposition auf der Platte (ungenutzt bei sparse Runs)
-    position: u64,
-    /// Verbleibende Bytes im aktuellen Run
-    remaining: u64,
-    sparse: bool,
 }
 
 #[cfg(target_os = "windows")]
-impl<'a> VolumeSource<'a> {
-    fn new(volume: &'a Volume, runs: Vec<DataRun>, bytes_per_cluster: u64, record_size: usize) -> Self {
+impl VolumeSource {
+    fn new(
+        volumes: Vec<Volume>,
+        runs: &[DataRun],
+        bytes_per_cluster: u64,
+        stream_len: u64,
+        record_size: usize,
+    ) -> Self {
+        let mut extents = Vec::with_capacity(runs.len());
+        let mut stream_offset = 0;
+        for run in runs {
+            let len = run.length * bytes_per_cluster;
+            extents.push(Extent {
+                stream_offset,
+                disk_offset: run.lcn.map(|lcn| lcn * bytes_per_cluster),
+                len,
+            });
+            stream_offset += len;
+        }
         Self {
-            volume,
-            runs,
+            volumes,
+            extents,
             bytes_per_cluster,
+            stream_len,
             record_size,
-            next_run: 0,
-            position: 0,
-            remaining: 0,
-            sparse: false,
         }
     }
 }
 
 #[cfg(target_os = "windows")]
-impl RecordSource for VolumeSource<'_> {
-    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError> {
-        loop {
-            if self.remaining == 0 {
-                // Nächstes Fragment
-                let Some(run) = self.runs.get(self.next_run) else {
-                    return Ok(0);
-                };
-                self.next_run += 1;
-                self.remaining = run.length * self.bytes_per_cluster;
-                match run.lcn {
-                    Some(lcn) => {
-                        self.sparse = false;
-                        self.position = lcn * self.bytes_per_cluster;
-                    }
-                    None => self.sparse = true,
-                }
-                continue;
-            }
+impl RecordSource for VolumeSource {
+    fn parallelism(&self) -> usize {
+        self.volumes.len()
+    }
 
-            // Run-Längen sind ganze Cluster, der Puffer ein Vielfaches davon:
-            // beides bleibt sektorausgerichtet, wie es das Lesen ohne Cache verlangt
-            let wanted = self.remaining.min(buffer.len() as u64) as usize;
-            if self.sparse {
-                // Kein Platz auf der Platte belegt: die Records gelten als leer
-                buffer[..wanted].fill(0);
-                self.remaining -= wanted as u64;
-                return Ok(wanted);
-            }
-
-            let got = self.volume.read_at(self.position, &mut buffer[..wanted])?;
-            let usable = got - got % self.record_size;
-            if usable == 0 {
-                return Ok(0); // Ende des Laufwerks oder Lesefehler
-            }
-            self.position += usable as u64;
-            self.remaining -= usable as u64;
-            return Ok(usable);
+    fn read_block(&self, slot: usize, block: usize, buffer: &mut [u8]) -> Result<usize, MftError> {
+        let start = block as u64 * buffer.len() as u64;
+        if start >= self.stream_len {
+            return Ok(0);
         }
+        let wanted = (self.stream_len - start).min(buffer.len() as u64) as usize;
+        // Ohne Cache nur ganze Cluster lesen; die Fragmente sind
+        // clustergroß, der Puffer ein Vielfaches davon
+        let cluster = self.bytes_per_cluster as usize;
+        let to_read = (wanted.div_ceil(cluster) * cluster).min(buffer.len());
+        let volume = &self.volumes[slot];
+
+        let mut filled = 0;
+        let mut index = self
+            .extents
+            .partition_point(|extent| extent.stream_offset + extent.len <= start);
+        while filled < to_read {
+            let Some(extent) = self.extents.get(index) else {
+                break; // MFT-Strom endet vor der gemeldeten Größe
+            };
+            let within = start + filled as u64 - extent.stream_offset;
+            let piece = ((extent.len - within) as usize).min(to_read - filled);
+            match extent.disk_offset {
+                None => buffer[filled..filled + piece].fill(0),
+                Some(disk_offset) => {
+                    let got = volume.read_at(disk_offset + within, &mut buffer[filled..filled + piece])?;
+                    if got < piece {
+                        filled += got;
+                        break; // Ende des Laufwerks
+                    }
+                }
+            }
+            filled += piece;
+            index += 1;
+        }
+
+        let usable = filled.min(wanted);
+        Ok(usable - usable % self.record_size)
     }
 }
 
-/// Liest eine Dump-Datei sequentiell
+/// Liest eine Dump-Datei; positionierte Lesezugriffe brauchen keinen
+/// gemeinsamen Dateizeiger
 struct FileSource {
     file: File,
     record_size: usize,
+    stream_len: u64,
+}
+
+impl FileSource {
+    #[cfg(target_os = "windows")]
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::windows::fs::FileExt;
+        self.file.seek_read(buffer, offset)
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> std::io::Result<usize> {
+        use std::os::unix::fs::FileExt;
+        self.file.read_at(buffer, offset)
+    }
 }
 
 impl RecordSource for FileSource {
-    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError> {
+    fn parallelism(&self) -> usize {
+        // Aus dem Dateicache heraus limitiert das Kopieren, nicht die Platte
+        2
+    }
+
+    fn read_block(&self, _slot: usize, block: usize, buffer: &mut [u8]) -> Result<usize, MftError> {
+        let start = block as u64 * buffer.len() as u64;
+        if start >= self.stream_len {
+            return Ok(0);
+        }
+        let wanted = (self.stream_len - start).min(buffer.len() as u64) as usize;
         let mut filled = 0;
-        while filled < buffer.len() {
-            let got = self.file.read(&mut buffer[filled..])?;
+        while filled < wanted {
+            let got = self.read_at(
+                DUMP_HEADER_SIZE as u64 + start + filled as u64,
+                &mut buffer[filled..wanted],
+            )?;
             if got == 0 {
                 break;
             }
@@ -442,16 +536,17 @@ impl RecordSource for FileSource {
 
 /// Der eigentliche Scan: Records blockweise holen, Fixups anwenden, parsen
 ///
-/// Zwei Puffer im Wechsel: während ein Block geparst wird (parallel über
-/// alle Kerne, jeder Record ist unabhängig), liest ein zweiter Thread schon
-/// den nächsten von der Platte. Die Record-Nummer läuft über alle Blöcke
-/// hinweg durch - sie ist die Position innerhalb der MFT, nicht auf der Platte.
+/// Zwei Sätze Puffer im Wechsel: während ein Satz geparst wird (parallel
+/// über alle Kerne, jeder Record ist unabhängig), lesen andere Threads
+/// schon den nächsten Satz - jeder Puffer ein eigener Block, gleichzeitig.
+/// Die Record-Nummer ergibt sich aus der Blocknummer: sie ist die Position
+/// innerhalb der MFT, nicht auf der Platte.
 ///
 /// Die Einträge landen dicht in einem Vektor, Index = Record-Nummer. Das
 /// spart das Hashen von Millionen Schlüsseln, und Erweiterungs-Records finden
 /// ihren Basis-Record ohne Suche - egal ob sie vor oder nach ihm kommen.
 fn scan_source<F>(
-    source: &mut dyn RecordSource,
+    source: &dyn RecordSource,
     record_size: usize,
     total_records: u64,
     mut dump: Option<&mut BufWriter<File>>,
@@ -467,49 +562,72 @@ where
             MftError::ReadError(format!("MFT mit {} Records ist unplausibel groß", total_records))
         })?;
 
-    let chunk_records = (READ_CHUNK_SIZE / record_size).max(1);
-    let mut current = AlignedBuffer::new(chunk_records * record_size);
-    let mut next = AlignedBuffer::new(chunk_records * record_size);
+    let chunk_size = std::env::var("RUSTREE_CHUNK_MB")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|mb| (1..=256).contains(mb))
+        .map_or(READ_CHUNK_SIZE, |mb| mb * 1024 * 1024);
+    let chunk_records = (chunk_size / record_size).max(1);
+    let chunk_bytes = chunk_records * record_size;
+    let parallelism = source.parallelism().max(1);
+    let new_buffers = || -> Vec<AlignedBuffer> {
+        (0..parallelism).map(|_| AlignedBuffer::new(chunk_bytes)).collect()
+    };
+    let mut current = new_buffers();
+    let mut next = new_buffers();
 
     let mut entries: Vec<Option<FileEntry>> = vec![None; slots];
     let mut name_ranks: Vec<u8> = vec![0; slots];
     let mut extensions: Vec<ExtensionRecord> = Vec::new();
     let mut found: usize = 0;
-    let mut first_reference: u64 = 0;
+    // Nummer des ersten Blocks im aktuellen Satz
+    let mut first_block: usize = 0;
 
-    let mut usable = source.read_chunk(current.as_mut_slice())?;
-    while usable > 0 && first_reference < total_records {
+    let mut usable = read_group(source, first_block, &mut current)?;
+    while usable[0] > 0 {
         // Rohdaten vor den Fixups sichern, damit der Dump der Platte entspricht
         if let Some(dump) = dump.as_mut() {
-            dump.write_all(&current.as_slice()[..usable])?;
-        }
-
-        let block = &mut current.as_mut_slice()[..usable];
-        let (next_usable, parsed) = rayon::join(
-            || source.read_chunk(next.as_mut_slice()),
-            || parse_block(block, record_size, first_reference, total_records),
-        );
-
-        for (reference, record) in parsed {
-            match record {
-                ParsedRecord::Entry { entry, name_rank } => {
-                    let slot = reference as usize;
-                    name_ranks[slot] = name_rank;
-                    if entries[slot].replace(entry).is_none() {
-                        found += 1;
-                    }
-                }
-                ParsedRecord::Extension(extension) => extensions.push(extension),
+            for (buffer, &len) in current.iter().zip(&usable) {
+                dump.write_all(&buffer.as_slice()[..len])?;
             }
         }
-        first_reference += (usable / record_size) as u64;
 
-        let progress = (first_reference as f32 / total_records as f32).min(0.99);
+        // Parsen und Einsortieren laufen beide, während der nächste Satz
+        // gelesen wird - die Platte soll nie auf uns warten
+        let (next_usable, ()) = rayon::join(
+            || read_group(source, first_block + parallelism, &mut next),
+            || {
+                let parsed: Vec<Vec<(u64, ParsedRecord)>> = current
+                    .par_iter_mut()
+                    .zip(&usable)
+                    .enumerate()
+                    .map(|(offset, (buffer, &len))| {
+                        let first_reference = ((first_block + offset) * chunk_records) as u64;
+                        parse_block(&mut buffer.as_mut_slice()[..len], record_size, first_reference, total_records)
+                    })
+                    .collect();
+
+                for (reference, record) in parsed.into_iter().flatten() {
+                    match record {
+                        ParsedRecord::Entry { entry, name_rank } => {
+                            let slot = reference as usize;
+                            name_ranks[slot] = name_rank;
+                            if entries[slot].replace(entry).is_none() {
+                                found += 1;
+                            }
+                        }
+                        ParsedRecord::Extension(extension) => extensions.push(extension),
+                    }
+                }
+            },
+        );
+        first_block += parallelism;
+
+        let done = ((first_block * chunk_records) as u64).min(total_records);
+        let progress = (done as f32 / total_records as f32).min(0.99);
         let status = format!(
             "{} von {} Records, {} Dateien/Ordner...",
-            first_reference.min(total_records),
-            total_records,
-            found
+            done, total_records, found
         );
         progress_callback(progress, &status);
 
@@ -535,6 +653,20 @@ where
     progress_callback(1.0, &final_status);
 
     Ok(entries)
+}
+
+/// Liest einen Satz aufeinanderfolgender Blöcke gleichzeitig, einer pro
+/// Puffer; liefert die nutzbaren Bytes je Puffer (0 hinter dem Ende)
+fn read_group(
+    source: &dyn RecordSource,
+    first_block: usize,
+    buffers: &mut [AlignedBuffer],
+) -> Result<Vec<usize>, MftError> {
+    buffers
+        .par_iter_mut()
+        .enumerate()
+        .map(|(slot, buffer)| source.read_block(slot, first_block + slot, buffer.as_mut_slice()))
+        .collect()
 }
 
 /// Trägt die ausgelagerten Attribute in die Basis-Records ein
@@ -596,7 +728,7 @@ fn parse_block(
 /// Lesepuffer mit sektorausgerichteter Startadresse
 ///
 /// `Vec<u8>` garantiert nur die Ausrichtung von `u8`; `FILE_FLAG_NO_BUFFERING`
-/// verlangt Sektorgrenzen. Der Puffer wird einmal pro Scan angelegt.
+/// verlangt Sektorgrenzen. Die Puffer werden einmal pro Scan angelegt.
 struct AlignedBuffer {
     ptr: NonNull<u8>,
     layout: Layout,
@@ -634,6 +766,7 @@ impl Drop for AlignedBuffer {
 
 // SAFETY: ein eigener Heap-Block ohne geteilten Zustand; wie ein Vec<u8>
 unsafe impl Send for AlignedBuffer {}
+unsafe impl Sync for AlignedBuffer {}
 
 /// Informationen aus dem NTFS Boot-Sektor
 struct BootSectorInfo {
@@ -691,7 +824,8 @@ impl Volume {
     }
 
     /// Liest an einer absoluten Byte-Position; Offset und Länge müssen
-    /// Vielfache der Sektorgröße sein (Raw-Device)
+    /// Vielfache der Sektorgröße sein (Raw-Device). Ein Handle verträgt nur
+    /// einen Aufruf zur Zeit - der Dateizeiger ist Teil des Handles.
     fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, MftError> {
         let mut bytes_read = 0u32;
         unsafe {
@@ -703,7 +837,7 @@ impl Volume {
 }
 
 // SAFETY: ein Datei-Handle darf von jedem Thread benutzt werden; wir lesen
-// nur, und immer von genau einem Thread zur Zeit.
+// nur, und jedes Handle wird von genau einem Slot benutzt.
 #[cfg(target_os = "windows")]
 unsafe impl Send for Volume {}
 #[cfg(target_os = "windows")]
@@ -721,20 +855,24 @@ impl Drop for Volume {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::mft::parser::test_support::*;
     use crate::mft::parser::file_name_namespace;
+    use crate::mft::parser::test_support::*;
 
-    /// Records aus dem Speicher, als wären sie eine MFT
+    /// Records aus dem Speicher, als wären sie eine MFT; drei Slots, damit
+    /// der Gruppen-Wechsel im Scan mitgetestet wird
     struct SliceSource {
         data: Vec<u8>,
-        position: usize,
     }
 
     impl RecordSource for SliceSource {
-        fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError> {
-            let count = (self.data.len() - self.position).min(buffer.len());
-            buffer[..count].copy_from_slice(&self.data[self.position..self.position + count]);
-            self.position += count;
+        fn parallelism(&self) -> usize {
+            3
+        }
+
+        fn read_block(&self, _slot: usize, block: usize, buffer: &mut [u8]) -> Result<usize, MftError> {
+            let start = (block * buffer.len()).min(self.data.len());
+            let count = (self.data.len() - start).min(buffer.len());
+            buffer[..count].copy_from_slice(&self.data[start..start + count]);
             Ok(count)
         }
     }
@@ -745,8 +883,8 @@ mod tests {
             let start = *reference as usize * 1024;
             data[start..start + 1024].copy_from_slice(record);
         }
-        let mut source = SliceSource { data, position: 0 };
-        scan_source(&mut source, 1024, total, None, |_, _| {}).unwrap()
+        let source = SliceSource { data };
+        scan_source(&source, 1024, total, None, |_, _| {}).unwrap()
     }
 
     #[test]
@@ -798,6 +936,18 @@ mod tests {
         let entries = scan_records(&[(5, root), (6, nameless), (2, system), (9, recycle)], 10);
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec![".", "$Recycle.Bin"]);
+    }
+
+    #[test]
+    fn records_keep_their_number_across_blocks() {
+        // Mehr Records als in einen Satz Blöcke passen (3 Slots à 8 MiB =
+        // 24.576 Records): Record-Nummern müssen über Sätze hinweg stimmen
+        let total = 3 * (READ_CHUNK_SIZE / 1024) as u64 + 5;
+        let root = build_record(0x03, &[file_name_attr(5, ".", file_name_namespace::WIN32)]);
+        let last = build_record(0x01, &[file_name_attr(5, "last.txt", file_name_namespace::WIN32)]);
+        let entries = scan_records(&[(5, root), (total - 1, last)], total);
+        let refs: Vec<u64> = entries.iter().map(|e| e.mft_reference).collect();
+        assert_eq!(refs, vec![5, total - 1]);
     }
 
     #[test]

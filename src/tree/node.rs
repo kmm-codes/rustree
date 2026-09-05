@@ -7,6 +7,7 @@
 //! wird nicht gespeichert, sondern bei Bedarf aus dem Weg durch den Baum
 //! gebildet (siehe [`crate::tree::TreeBuilder::top_n`]).
 
+use rayon::prelude::*;
 use std::cmp::Ordering;
 
 /// Ein Knoten im Verzeichnisbaum
@@ -79,12 +80,22 @@ impl TreeNode {
     /// ganzen Teilbaum. Einmal an der Wurzel aufrufen, nicht pro Ebene:
     /// sonst wird jeder Ordner so oft sortiert, wie er tief liegt.
     pub fn sort_by_size(&mut self) {
+        self.sort_by_size_at(0);
+    }
+
+    /// Wie [`TreeNode::sort_by_size`]; die obersten Ebenen parallel
+    fn sort_by_size_at(&mut self, depth: usize) {
         self.children
             .sort_unstable_by(|a, b| b.total_size.cmp(&a.total_size));
 
-        for child in &mut self.children {
-            if child.is_directory {
-                child.sort_by_size();
+        if depth < super::builder::PARALLEL_DEPTH {
+            self.children
+                .par_iter_mut()
+                .filter(|child| child.is_directory)
+                .for_each(|child| child.sort_by_size_at(depth + 1));
+        } else {
+            for child in self.children.iter_mut().filter(|child| child.is_directory) {
+                child.sort_by_size_at(depth + 1);
             }
         }
     }

@@ -77,6 +77,11 @@ cargo run --example ui_preview                                 # GUI mit Beispie
 Die Statuszeile der GUI und die CLI zeigen die Dauer getrennt nach Scan
 (MFT lesen und parsen) und Baum (Verzeichnisbaum aufbauen).
 
+Zum Ausprobieren auf anderer Hardware lassen sich zwei Stellschrauben des
+Lesers per Umgebungsvariable setzen: `RUSTREE_READERS` (gleichzeitige
+Lesezugriffe, Standard 4) und `RUSTREE_CHUNK_MB` (Blockgröße, Standard 8).
+Auf einem NVMe-Laufwerk mit 4,4 GB MFT: 1 Leser 3,4 s, 4 Leser 2,3 s Scan.
+
 ## Aufbau
 
 ```

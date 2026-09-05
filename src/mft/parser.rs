@@ -378,14 +378,15 @@ impl MftParser {
         // Namenlänge in Characters (Offset 64)
         let name_length = *content.get(64)? as usize;
 
-        // Name startet bei Offset 66 (UTF-16LE)
+        // Name startet bei Offset 66 (UTF-16LE). Direkt in den String
+        // dekodieren: eine Allokation pro Name statt zwei - bei Millionen
+        // Namen der teuerste Teil des Parsens.
         let name_bytes = content.get(66..66 + name_length * 2)?;
-        let name_u16: Vec<u16> = name_bytes
+        let units = name_bytes
             .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect();
-
-        let name = String::from_utf16_lossy(&name_u16);
+            .map(|c| u16::from_le_bytes([c[0], c[1]]));
+        let mut name = String::with_capacity(name_length);
+        name.extend(char::decode_utf16(units).map(|c| c.unwrap_or(char::REPLACEMENT_CHARACTER)));
 
         Some(FileNameAttr {
             parent_reference,

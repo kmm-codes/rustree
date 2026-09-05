@@ -23,6 +23,10 @@
 //! Zwei lineare Durchläufe (zählen, einsortieren), keine Suche, kein
 //! Hashen: Zählsortierung nach Parent.
 //!
+//! Die obersten Ebenen des Baums entstehen parallel: jeder Teilbaum ist
+//! unabhängig, und unter `C:\Users\<name>` oder `C:\Windows` stecken
+//! Hunderttausende Knoten - genug Arbeit für alle Kerne.
+//!
 //! Sortiert wird genau einmal, von der Wurzel aus: würde jeder Ordner beim
 //! Aufbau seinen Teilbaum sortieren, wäre ein Ordner in Tiefe 12 zwölfmal
 //! sortiert. Und kein Knoten trägt seinen vollen Pfad - bei Millionen
@@ -30,12 +34,17 @@
 
 use super::node::TreeNode;
 use crate::mft::FileEntry;
+use rayon::prelude::*;
 
 /// MFT-Referenz des Root-Verzeichnisses
 const ROOT_REFERENCE: u64 = 5;
 
 /// Markierung in `index_of` für Referenzen ohne Eintrag
 const NO_ENTRY: u32 = u32::MAX;
+
+/// Bis zu dieser Tiefe werden Teilbäume parallel gebaut und sortiert;
+/// darunter ist die Arbeit pro Ordner zu klein für den Thread-Wechsel
+pub(crate) const PARALLEL_DEPTH: usize = 3;
 
 /// Der TreeBuilder konstruiert den Baum aus MFT-Daten
 pub struct TreeBuilder {
@@ -123,12 +132,9 @@ impl TreeBuilder {
     }
 
     /// Baut den Baum ab dem Root-Verzeichnis auf, sortiert nach Größe
-    ///
-    /// Verbraucht den Builder: die Namen wandern in den Baum, statt kopiert
-    /// zu werden.
-    pub fn build(mut self) -> TreeNode {
+    pub fn build(&self) -> TreeNode {
         let mut root = match self.index_of.get(ROOT_REFERENCE as usize).copied() {
-            Some(position) if position != NO_ENTRY => self.build_subtree(position as usize),
+            Some(position) if position != NO_ENTRY => self.build_subtree(position as usize, 0),
             _ => {
                 // Fallback: Wurzel ohne Eintrag
                 let mut node = TreeNode::new_directory(String::new());
@@ -140,29 +146,36 @@ impl TreeBuilder {
         root
     }
 
-    /// Baut einen Teilbaum rekursiv auf (unsortiert)
-    fn build_subtree(&mut self, position: usize) -> TreeNode {
-        let entry = &mut self.entries[position];
-        let name = std::mem::take(&mut entry.name);
-        let id = entry.mft_reference;
-
+    /// Baut einen Teilbaum rekursiv auf (unsortiert); die obersten Ebenen
+    /// parallel, siehe [`PARALLEL_DEPTH`]
+    fn build_subtree(&self, position: usize, depth: usize) -> TreeNode {
+        let entry = &self.entries[position];
+        let mut node = if entry.is_directory {
+            TreeNode::new_directory(entry.name.clone())
+        } else {
+            TreeNode::new_file(entry.name.clone(), entry.size)
+        };
+        node.id = entry.mft_reference;
         if !entry.is_directory {
-            let mut node = TreeNode::new_file(name, entry.size);
-            node.id = id;
             return node;
         }
 
-        let mut node = TreeNode::new_directory(name);
-        node.id = id;
-
-        let (start, end) = (
-            self.child_start[position] as usize,
-            self.child_start[position + 1] as usize,
-        );
-        node.children.reserve_exact(end - start);
-        for i in start..end {
-            let child = self.children[i] as usize;
-            node.add_child(self.build_subtree(child));
+        let children = &self.children
+            [self.child_start[position] as usize..self.child_start[position + 1] as usize];
+        if depth < PARALLEL_DEPTH {
+            let built: Vec<TreeNode> = children
+                .par_iter()
+                .map(|&child| self.build_subtree(child as usize, depth + 1))
+                .collect();
+            node.children.reserve_exact(built.len());
+            for child in built {
+                node.add_child(child);
+            }
+        } else {
+            node.children.reserve_exact(children.len());
+            for &child in children {
+                node.add_child(self.build_subtree(child as usize, depth + 1));
+            }
         }
 
         node

@@ -24,6 +24,10 @@ slint = { version = "1.9", default-features = false, features = [
     "renderer-skia",
 ] }
 
+# Allokator: Millionen kleiner Strings (Dateinamen) aus vielen Threads -
+# der Windows-Heap skaliert dabei schlecht, mimalloc gut
+mimalloc = { version = "0.1", default-features = false }
+
 # NTFS MFT access
 ntfs = "0.4"
 windows = { version = "0.58", features = [
