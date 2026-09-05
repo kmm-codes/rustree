@@ -102,9 +102,17 @@ export component MainWindow inherits Window {
                     }
 
                     ListView {
+                        // Feste Positionierung statt HorizontalBox: die Zeile
+                        // bleibt genau so breit wie die Liste (ein Layout würde
+                        // sich an langen Namen orientieren und die Liste
+                        // horizontal scrollbar machen), und der Name bekommt
+                        // eine echte Breite und Höhe, damit overflow: elide
+                        // greift statt die Zeile ganz zu verwerfen.
                         for entry[index] in tree_entries: Rectangle {
                             height: 28px;
                             background: touch.has-hover ? #45475a : transparent;
+
+                            property <length> indent: entry.depth * 20px + 8px;
 
                             touch := TouchArea {
                                 clicked => {
@@ -112,42 +120,46 @@ export component MainWindow inherits Window {
                                 }
                             }
 
-                            HorizontalBox {
-                                padding-left: entry.depth * 20px + 8px;
-                                spacing: 8px;
+                            // Expand/Collapse Icon
+                            Text {
+                                x: indent;
+                                width: 16px;
+                                height: parent.height;
+                                text: entry.has_children ? (entry.expanded ? "▼" : "▶") : "";
+                                color: #89b4fa;
+                                horizontal-alignment: center;
+                                vertical-alignment: center;
+                            }
 
-                                // Expand/Collapse Icon
-                                Text {
-                                    text: entry.has_children ? (entry.expanded ? "▼" : "▶") : "  ";
-                                    color: #89b4fa;
-                                    width: 16px;
-                                    vertical-alignment: center;
-                                }
+                            // Ordner/Datei Icon
+                            Text {
+                                x: indent + 24px;
+                                width: 20px;
+                                height: parent.height;
+                                text: entry.is_directory ? "📁" : "📄";
+                                vertical-alignment: center;
+                            }
 
-                                // Ordner/Datei Icon
-                                Text {
-                                    text: entry.is_directory ? "📁" : "📄";
-                                    width: 20px;
-                                    vertical-alignment: center;
-                                }
+                            // Name
+                            Text {
+                                x: indent + 52px;
+                                width: max(0px, parent.width - self.x - 96px);
+                                height: parent.height;
+                                text: entry.name;
+                                color: entry.is_directory ? #89dceb : #cdd6f4;
+                                overflow: elide;
+                                vertical-alignment: center;
+                            }
 
-                                // Name
-                                Text {
-                                    text: entry.name;
-                                    color: entry.is_directory ? #89dceb : #cdd6f4;
-                                    horizontal-stretch: 1;
-                                    overflow: elide;
-                                    vertical-alignment: center;
-                                }
-
-                                // Größe
-                                Text {
-                                    text: entry.size;
-                                    color: #f9e2af;
-                                    horizontal-alignment: right;
-                                    width: 80px;
-                                    vertical-alignment: center;
-                                }
+                            // Größe
+                            Text {
+                                x: parent.width - 88px;
+                                width: 80px;
+                                height: parent.height;
+                                text: entry.size;
+                                color: #f9e2af;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
                             }
                         }
                     }
