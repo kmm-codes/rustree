@@ -3,6 +3,11 @@
 //! Dieses Programm nutzt die NTFS Master File Table (MFT) um
 //! blitzschnell die Speicherbelegung auf Windows-Laufwerken zu analysieren.
 
+// GUI-Subsystem: beim Start aus dem Startmenü geht kein Konsolenfenster auf.
+// Ausgaben für --cli, --help und Fehler holen wir uns in main() über die
+// Konsole des Aufrufers zurück, siehe attach_parent_console().
+#![windows_subsystem = "windows"]
+
 use clap::Parser;
 use slint::SharedString;
 use std::collections::HashSet;
@@ -32,6 +37,10 @@ struct Args {
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Vor dem Parsen, damit auch clap (--help, Fehlermeldungen) ein Ziel hat
+    #[cfg(target_os = "windows")]
+    attach_parent_console();
+
     let args = Args::parse();
 
     if args.cli {
@@ -41,6 +50,27 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     Ok(())
+}
+
+/// Hängt den Prozess an die Konsole des Elternprozesses, falls es eine gibt.
+///
+/// Die EXE ist ein Windows-GUI-Programm (`windows_subsystem = "windows"`) und
+/// bekommt deshalb keine eigene Konsole. Aus einem Terminal gestartet sollen
+/// `--cli`, `--help` und Fehlermeldungen trotzdem dort erscheinen, also holen
+/// wir uns die Konsole des Aufrufers. Ohne Terminal (Explorer, Startmenü)
+/// schlägt der Aufruf fehl - das ist der Normalfall für die GUI und in Ordnung.
+///
+/// Einschränkung: fordert UAC die Admin-Rechte an, startet der AppInfo-Dienst
+/// den Prozess, nicht das Terminal. Dann gibt es keine Eltern-Konsole; aus
+/// einem Administrator-Terminal heraus klappt es.
+#[cfg(target_os = "windows")]
+fn attach_parent_console() {
+    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+
+    // SAFETY: reiner Win32-Aufruf ohne Zeiger; ein Fehlschlag ist erlaubt.
+    unsafe {
+        let _ = AttachConsole(ATTACH_PARENT_PROCESS);
+    }
 }
 
 /// Globaler State für Thread-Sicherheit
