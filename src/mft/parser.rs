@@ -44,6 +44,17 @@
 //! dort nur eine Liste von Fragmenten auf der Platte, die Data Runs. Für die
 //! `$MFT` selbst brauchen wir sie, um alle Records zu finden: die MFT ist auf
 //! realen Laufwerken fast immer fragmentiert.
+//!
+//! # Erweiterungs-Records
+//!
+//! Passen die Attribute selbst nicht mehr in einen Record - stark
+//! fragmentierte Dateien mit langen Run-Listen, Dateien mit vielen Hardlinks
+//! (jeder ist ein `$FILE_NAME`) - lagert NTFS sie in weitere Records aus und
+//! verzeichnet das im `$ATTRIBUTE_LIST` (0x20) des Basis-Records. Die
+//! ausgelagerten Records zeigen bei Offset 32 auf ihren Basis-Record. Ohne
+//! sie fehlen genau die größten Dateien im Ergebnis, und manche Ordner
+//! tragen nur ihren 8.3-Namen. [`MftParser::parse`] liefert sie deshalb als
+//! [`ParsedRecord::Extension`] zum späteren Zusammenführen.
 
 use super::types::FileEntry;
 
@@ -89,6 +100,38 @@ pub struct DataRun {
     pub lcn: Option<u64>,
     /// Länge in Clustern
     pub length: u64,
+}
+
+/// Ergebnis von [`MftParser::parse`]
+#[derive(Debug, Clone)]
+pub enum ParsedRecord {
+    /// Ein Basis-Record: eine Datei oder ein Ordner
+    Entry {
+        entry: FileEntry,
+        /// Rang des gefundenen Namens (siehe [`name_rank`]); 0 = noch keiner
+        name_rank: u8,
+    },
+    /// Ein Erweiterungs-Record mit Attributen, die zu einem anderen Record gehören
+    Extension(ExtensionRecord),
+}
+
+/// Attribute aus einem Erweiterungs-Record, die der Basis-Record braucht
+#[derive(Debug, Clone)]
+pub struct ExtensionRecord {
+    /// MFT-Referenz des Basis-Records (ohne Sequenznummer)
+    pub base_reference: u64,
+    /// Größe des unbenannten `$DATA`-Streams, falls sein erstes Stück hier liegt
+    pub data_size: Option<u64>,
+    /// Bester `$FILE_NAME` in diesem Record
+    pub file_name: Option<ExtensionName>,
+}
+
+/// Ein Name aus einem Erweiterungs-Record
+#[derive(Debug, Clone)]
+pub struct ExtensionName {
+    pub rank: u8,
+    pub parent_reference: u64,
+    pub name: String,
 }
 
 /// Der MFT-Parser verarbeitet rohe MFT-Records
@@ -157,15 +200,30 @@ impl MftParser {
 
     /// Parst einen rohen MFT-Record und extrahiert die Dateiinformationen
     ///
+    /// Bequeme Variante von [`MftParser::parse`] für Basis-Records mit Namen:
+    /// `None` bei leeren/gelöschten Records, Erweiterungs-Records und
+    /// Records ohne Namen.
+    pub fn parse_record(record: &[u8], mft_reference: u64) -> Option<FileEntry> {
+        match Self::parse(record, mft_reference)? {
+            ParsedRecord::Entry { entry, .. } if !entry.name.is_empty() => Some(entry),
+            _ => None,
+        }
+    }
+
+    /// Parst einen rohen MFT-Record
+    ///
     /// # Parameter
     /// - `record`: Die Bytes des MFT-Records nach [`MftParser::apply_fixups`]
     /// - `mft_reference`: Die MFT-Referenznummer dieses Records
     ///
     /// # Rückgabe
-    /// - `Some(FileEntry)` wenn der Record eine Datei oder einen Ordner beschreibt
-    /// - `None` bei leeren/gelöschten Records, Erweiterungs-Records und
-    ///   Records ohne Namen (Systemdaten)
-    pub fn parse_record(record: &[u8], mft_reference: u64) -> Option<FileEntry> {
+    /// - [`ParsedRecord::Entry`] für eine Datei oder einen Ordner. Der Name
+    ///   ist leer, wenn er per `$ATTRIBUTE_LIST` in einem Erweiterungs-Record
+    ///   liegt; solche Einträge sind erst nach dem Zusammenführen brauchbar.
+    /// - [`ParsedRecord::Extension`] für Records, die zu einer anderen Datei
+    ///   gehören
+    /// - `None` bei leeren/gelöschten Records und namenlosen Systemdaten
+    pub fn parse(record: &[u8], mft_reference: u64) -> Option<ParsedRecord> {
         // Prüfe Signatur "FILE"
         if record.len() < 48 || &record[0..4] != b"FILE" {
             return None;
@@ -181,19 +239,17 @@ impl MftParser {
 
         let is_directory = flags & 0x02 != 0;
 
-        // Erweiterungs-Records (Offset 32: Referenz auf den Basis-Record)
-        // gehören zu einer anderen Datei und beschreiben keine eigene.
+        // Offset 32: Referenz auf den Basis-Record, 0 bei Basis-Records
+        // selbst. Die oberen 16 Bit sind die Sequenznummer.
         let base_record =
             u64::from_le_bytes(record[32..40].try_into().ok()?) & 0x0000_FFFF_FFFF_FFFF;
-        if base_record != 0 {
-            return None;
-        }
 
         // Attribute durchlaufen
         let mut best_name: Option<(u8, FileNameAttr)> = None;
-        let mut size: u64 = 0;
+        let mut size: Option<u64> = None;
         let mut is_hidden = false;
         let mut is_system = false;
+        let mut has_attribute_list = false;
 
         for (attr_type, attr) in Self::attributes(record) {
             match attr_type {
@@ -204,6 +260,7 @@ impl MftParser {
                         is_system = std_info.is_system;
                     }
                 }
+                attribute_types::ATTRIBUTE_LIST => has_attribute_list = true,
                 attribute_types::FILE_NAME => {
                     // $FILE_NAME enthält Name und Parent-Referenz. Der lange
                     // Windows-Name gewinnt gegen den 8.3-Namen (PROGRA~1),
@@ -220,7 +277,7 @@ impl MftParser {
                     // benannte Streams (z.B. Zone.Identifier) zählen nicht.
                     if Self::attribute_name_length(attr) == 0 {
                         if let Some(data_size) = Self::parse_data_attribute(attr) {
-                            size = data_size;
+                            size = Some(data_size);
                         }
                     }
                 }
@@ -228,17 +285,38 @@ impl MftParser {
             }
         }
 
-        // Ignoriere Records ohne Namen (Systemdaten)
-        let (_, file_name) = best_name?;
+        if base_record != 0 {
+            return Some(ParsedRecord::Extension(ExtensionRecord {
+                base_reference: base_record,
+                data_size: size,
+                file_name: best_name.map(|(rank, file_name)| ExtensionName {
+                    rank,
+                    parent_reference: file_name.parent_reference,
+                    name: file_name.name,
+                }),
+            }));
+        }
 
-        Some(FileEntry {
-            mft_reference,
-            parent_reference: file_name.parent_reference,
-            name: file_name.name,
-            size,
-            is_directory,
-            is_hidden,
-            is_system,
+        // Records ohne Namen sind Systemdaten - außer der Name liegt per
+        // $ATTRIBUTE_LIST in einem Erweiterungs-Record: dann ein Platzhalter,
+        // den das Zusammenführen füllt
+        let (name_rank, parent_reference, name) = match best_name {
+            Some((rank, file_name)) => (rank, file_name.parent_reference, file_name.name),
+            None if has_attribute_list => (0, 0, String::new()),
+            None => return None,
+        };
+
+        Some(ParsedRecord::Entry {
+            entry: FileEntry {
+                mft_reference,
+                parent_reference,
+                name,
+                size: size.unwrap_or(0),
+                is_directory,
+                is_hidden,
+                is_system,
+            },
+            name_rank,
         })
     }
 
@@ -317,12 +395,20 @@ impl MftParser {
     }
 
     /// Parst das $DATA Attribut um die Dateigröße zu ermitteln
+    ///
+    /// Bei stark fragmentierten Dateien verteilt NTFS die Run-Liste auf
+    /// mehrere Attribut-Stücke in verschiedenen Records; jedes trägt die
+    /// Gesamtgröße, aber nur das erste (Start-VCN 0) zählt.
     fn parse_data_attribute(attr: &[u8]) -> Option<u64> {
         // Non-resident flag
         let non_resident = attr.get(8)? != &0;
 
         if non_resident {
-            // Bei non-resident: Real size bei Offset 48
+            // Start-VCN bei Offset 16; Real size bei Offset 48
+            let start_vcn = u64::from_le_bytes(attr.get(16..24)?.try_into().ok()?);
+            if start_vcn != 0 {
+                return None;
+            }
             Self::nonresident_real_size(attr)
         } else {
             // Bei resident: Content length bei Offset 16
@@ -474,16 +560,17 @@ struct FileNameAttr {
     namespace: u8,
 }
 
+/// Synthetische MFT-Records für Tests (auch vom Reader benutzt)
 #[cfg(test)]
-mod tests {
+pub(crate) mod test_support {
     use super::*;
 
-    const USN: [u8; 2] = [0x34, 0x12];
+    pub const USN: [u8; 2] = [0x34, 0x12];
 
     /// Baut einen 1024-Byte-Record: FILE-Header, Update Sequence Array bei
     /// Offset 48 (USN + zwei Sektoren), Attribute ab Offset 56, End Marker.
     /// Die Sektorenden tragen bereits die USN, wie auf der Platte.
-    fn build_record(flags: u16, attrs: &[Vec<u8>]) -> Vec<u8> {
+    pub fn build_record(flags: u16, attrs: &[Vec<u8>]) -> Vec<u8> {
         let mut record = vec![0u8; 1024];
         record[0..4].copy_from_slice(b"FILE");
         record[4..6].copy_from_slice(&48u16.to_le_bytes());
@@ -510,7 +597,7 @@ mod tests {
     }
 
     /// Residentes Attribut mit 24-Byte-Header und Inhalt, auf 8 Bytes gerundet
-    fn resident_attr(attr_type: u32, name_length: u8, content: &[u8]) -> Vec<u8> {
+    pub fn resident_attr(attr_type: u32, name_length: u8, content: &[u8]) -> Vec<u8> {
         let total = (24 + content.len()).div_ceil(8) * 8;
         let mut attr = vec![0u8; total];
         attr[0..4].copy_from_slice(&attr_type.to_le_bytes());
@@ -523,7 +610,7 @@ mod tests {
     }
 
     /// Non-residentes Attribut mit 64-Byte-Header, Data Runs ab Offset 64
-    fn nonresident_attr(attr_type: u32, real_size: u64, runs: &[u8]) -> Vec<u8> {
+    pub fn nonresident_attr(attr_type: u32, real_size: u64, runs: &[u8]) -> Vec<u8> {
         let total = (64 + runs.len()).div_ceil(8) * 8;
         let mut attr = vec![0u8; total];
         attr[0..4].copy_from_slice(&attr_type.to_le_bytes());
@@ -536,7 +623,7 @@ mod tests {
     }
 
     /// Inhalt eines $FILE_NAME-Attributs
-    fn file_name_content(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
+    pub fn file_name_content(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
         let utf16: Vec<u16> = name.encode_utf16().collect();
         let mut content = vec![0u8; 66 + utf16.len() * 2];
         content[0..8].copy_from_slice(&parent.to_le_bytes());
@@ -548,13 +635,25 @@ mod tests {
         content
     }
 
-    fn file_name_attr(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
+    pub fn file_name_attr(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
         resident_attr(
             attribute_types::FILE_NAME,
             0,
             &file_name_content(parent, name, namespace),
         )
     }
+
+    /// Macht aus einem Record einen Erweiterungs-Record von `base`
+    /// (mit Sequenznummer 3 im oberen Wort, die ignoriert werden muss)
+    pub fn make_extension(record: &mut [u8], base: u64) {
+        record[32..40].copy_from_slice(&(base | (3u64 << 48)).to_le_bytes());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::*;
+    use super::*;
 
     #[test]
     fn fixups_restore_sector_ends() {
@@ -633,13 +732,67 @@ mod tests {
         assert!(MftParser::parse_record(&unused, 1).is_none());
 
         let mut extension = build_record(0x01, &[name]);
-        extension[32..40].copy_from_slice(&42u64.to_le_bytes());
+        make_extension(&mut extension, 42);
         assert!(MftParser::apply_fixups(&mut extension));
         assert!(MftParser::parse_record(&extension, 2).is_none());
 
         let mut nameless = build_record(0x01, &[resident_attr(attribute_types::DATA, 0, &[0u8; 4])]);
         assert!(MftParser::apply_fixups(&mut nameless));
         assert!(MftParser::parse_record(&nameless, 3).is_none());
+    }
+
+    #[test]
+    fn extension_record_yields_its_attributes() {
+        let mut extension = build_record(
+            0x01,
+            &[
+                file_name_attr(5, "OneDrive.kg", file_name_namespace::WIN32),
+                nonresident_attr(attribute_types::DATA, 5_000, &[0x11, 0x01, 0x20, 0x00]),
+            ],
+        );
+        make_extension(&mut extension, 42);
+        assert!(MftParser::apply_fixups(&mut extension));
+
+        let Some(ParsedRecord::Extension(ext)) = MftParser::parse(&extension, 99) else {
+            panic!("Erweiterungs-Record erwartet");
+        };
+        assert_eq!(ext.base_reference, 42);
+        assert_eq!(ext.data_size, Some(5_000));
+        let name = ext.file_name.unwrap();
+        assert_eq!((name.name.as_str(), name.parent_reference, name.rank), ("OneDrive.kg", 5, 3));
+    }
+
+    #[test]
+    fn only_first_data_piece_carries_size() {
+        // Zweites Stück einer fragmentierten Datei: Start-VCN 8, Größe zählt nicht
+        let mut piece = nonresident_attr(attribute_types::DATA, 9_999, &[0x11, 0x01, 0x20, 0x00]);
+        piece[16..24].copy_from_slice(&8u64.to_le_bytes());
+        let mut record = build_record(
+            0x01,
+            &[
+                resident_attr(attribute_types::ATTRIBUTE_LIST, 0, &[0u8; 32]),
+                file_name_attr(5, "frag.bin", file_name_namespace::WIN32),
+                piece,
+            ],
+        );
+        assert!(MftParser::apply_fixups(&mut record));
+        assert_eq!(MftParser::parse_record(&record, 8).unwrap().size, 0);
+    }
+
+    #[test]
+    fn nameless_base_with_attribute_list_is_placeholder() {
+        let mut record = build_record(
+            0x01,
+            &[resident_attr(attribute_types::ATTRIBUTE_LIST, 0, &[0u8; 32])],
+        );
+        assert!(MftParser::apply_fixups(&mut record));
+
+        let Some(ParsedRecord::Entry { entry, name_rank }) = MftParser::parse(&record, 8) else {
+            panic!("Platzhalter erwartet");
+        };
+        assert_eq!(name_rank, 0);
+        assert!(entry.name.is_empty());
+        assert!(MftParser::parse_record(&record, 8).is_none());
     }
 
     #[test]

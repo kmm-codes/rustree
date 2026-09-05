@@ -389,7 +389,8 @@ fn run_cli(
     println!("Baue Verzeichnisbaum...");
     let tree_started = std::time::Instant::now();
     let builder = TreeBuilder::new(entries);
-    let tree = builder.build();
+    let mut tree = builder.build();
+    tree.name = drive.to_string();
     let tree_time = tree_started.elapsed();
 
     // Debug: Zeige erste Kinder des Root

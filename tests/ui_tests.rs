@@ -126,14 +126,10 @@ fn test_tree_node_add_child() {
 fn test_tree_builder() {
     use rustree::mft::FileEntry;
     use rustree::tree::TreeBuilder;
-    use std::collections::HashMap;
-
-    let mut entries = HashMap::new();
+    let mut entries = Vec::new();
 
     // Root (MFT 5)
-    entries.insert(
-        5,
-        FileEntry {
+    entries.push(FileEntry {
             mft_reference: 5,
             parent_reference: 5,
             name: String::new(),
@@ -145,9 +141,7 @@ fn test_tree_builder() {
     );
 
     // Ordner "Users" (MFT 100)
-    entries.insert(
-        100,
-        FileEntry {
+    entries.push(FileEntry {
             mft_reference: 100,
             parent_reference: 5,
             name: "Users".to_string(),
@@ -159,9 +153,7 @@ fn test_tree_builder() {
     );
 
     // Datei "test.txt" in Users (MFT 101)
-    entries.insert(
-        101,
-        FileEntry {
+    entries.push(FileEntry {
             mft_reference: 101,
             parent_reference: 100,
             name: "test.txt".to_string(),
