@@ -5,6 +5,14 @@ edition = "2021"
 description = "Fast NTFS disk space analyzer with GUI"
 authors = ["Kevin"]
 
+# Das Binary bekommt per build.rs das Admin-Manifest - auch sein Test-Harness,
+# das sich dann ohne Elevation nicht starten ließe. Alle Tests liegen in der
+# Library und unter tests/, also braucht das Binary kein eigenes.
+[[bin]]
+name = "rustree"
+path = "src/main.rs"
+test = false
+
 [dependencies]
 # GUI
 slint = "1.9"
