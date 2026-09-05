@@ -14,8 +14,15 @@ path = "src/main.rs"
 test = false
 
 [dependencies]
-# GUI
-slint = "1.9"
+# GUI - Skia statt FemtoVG: sauberere Textdarstellung (Hinting, Subpixel-
+# Positionierung) unter Windows. Qt-Backend und Software-Renderer entfallen.
+slint = { version = "1.9", default-features = false, features = [
+    "std",
+    "compat-1-2",
+    "accessibility",
+    "backend-winit",
+    "renderer-skia",
+] }
 
 # NTFS MFT access
 ntfs = "0.4"
