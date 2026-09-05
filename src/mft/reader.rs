@@ -18,9 +18,12 @@
 //! 4. Fragment für Fragment in großen Blöcken lesen, jeden Record per Fixup
 //!    korrigieren und parsen
 
-use super::parser::{attribute_types, MftParser};
+use super::parser::{attribute_types, DataRun, MftParser};
 use super::types::{FileEntry, MftError};
 use std::collections::HashMap;
+use std::fs::File;
+use std::io::{BufWriter, Read, Write};
+use std::path::Path;
 
 #[cfg(target_os = "windows")]
 use windows::{
@@ -39,6 +42,10 @@ const READ_CHUNK_SIZE: usize = 1024 * 1024;
 
 /// Fortschritt alle N Records melden
 const PROGRESS_INTERVAL: u64 = 16_384;
+
+/// Kopf einer MFT-Dump-Datei: Magic (8), Record-Größe (u32), reserviert (u32)
+const DUMP_MAGIC: &[u8; 8] = b"RTMFTv1\0";
+const DUMP_HEADER_SIZE: usize = 16;
 
 /// Der MFT-Reader - liest die Master File Table direkt aus
 pub struct MftReader {
@@ -128,6 +135,21 @@ impl MftReader {
     where
         F: Fn(f32, &str),
     {
+        self.scan_with_dump(None, progress_callback)
+    }
+
+    /// Wie [`MftReader::scan`], schreibt die rohen Records zusätzlich in eine
+    /// Dump-Datei, die [`MftReader::scan_dump`] später ohne Admin-Rechte
+    /// wieder einlesen kann - zum Messen und Testen des Parsers.
+    #[cfg(target_os = "windows")]
+    pub fn scan_with_dump<F>(
+        &self,
+        dump_to: Option<&Path>,
+        progress_callback: F,
+    ) -> Result<HashMap<u64, FileEntry>, MftError>
+    where
+        F: Fn(f32, &str),
+    {
         let record_size = self.bytes_per_mft_record as usize;
         if record_size == 0 || self.bytes_per_cluster == 0 {
             return Err(MftError::ReadError(
@@ -159,72 +181,50 @@ impl MftReader {
             return Err(MftError::InvalidRecord);
         }
 
-        // Schritt 4: Fragmente nacheinander in großen Blöcken lesen. Die
-        // Record-Nummer läuft über alle Fragmente hinweg durch - sie ist die
-        // Position innerhalb der MFT-Datei, nicht auf der Platte.
-        let chunk_records = (READ_CHUNK_SIZE / record_size).max(1);
-        let mut buffer = vec![0u8; chunk_records * record_size];
-        let mut entries: HashMap<u64, FileEntry> = HashMap::new();
-        let mut mft_reference: u64 = 0;
-        let mut next_progress = PROGRESS_INTERVAL;
+        let mut dump = match dump_to {
+            Some(path) => Some(Self::create_dump(path, record_size)?),
+            None => None,
+        };
 
-        'runs: for run in &runs {
-            let run_bytes = run.length * self.bytes_per_cluster;
+        // Schritt 4: Fragmente nacheinander in großen Blöcken lesen
+        let mut source = VolumeSource::new(&volume, runs, self.bytes_per_cluster, record_size);
+        scan_source(&mut source, record_size, total_records, dump.as_mut(), progress_callback)
+    }
 
-            let Some(lcn) = run.lcn else {
-                // Sparse: kein Platz auf der Platte belegt, die Records gelten als leer
-                mft_reference += run_bytes / record_size as u64;
-                continue;
-            };
-
-            let mut position = lcn * self.bytes_per_cluster;
-            let mut remaining = run_bytes;
-
-            while remaining > 0 && mft_reference < total_records {
-                let wanted = remaining.min(buffer.len() as u64) as usize;
-                let got = volume.read_at(position, &mut buffer[..wanted])?;
-                let usable = got - got % record_size;
-                if usable == 0 {
-                    break 'runs; // Ende des Laufwerks oder Lesefehler
-                }
-
-                for record in buffer[..usable].chunks_exact_mut(record_size) {
-                    if mft_reference >= total_records {
-                        break 'runs;
-                    }
-
-                    if MftParser::apply_fixups(record) {
-                        if let Some(entry) = MftParser::parse_record(record, mft_reference) {
-                            // Systemdateien mit $ überspringen (optional)
-                            if !entry.name.starts_with('$') || entry.name == "$Recycle.Bin" {
-                                entries.insert(mft_reference, entry);
-                            }
-                        }
-                    }
-
-                    mft_reference += 1;
-                    if mft_reference >= next_progress {
-                        next_progress += PROGRESS_INTERVAL;
-                        let progress = (mft_reference as f32 / total_records as f32).min(0.99);
-                        let status = format!(
-                            "{} von {} Records, {} Dateien/Ordner...",
-                            mft_reference,
-                            total_records,
-                            entries.len()
-                        );
-                        progress_callback(progress, &status);
-                    }
-                }
-
-                position += usable as u64;
-                remaining -= usable as u64;
-            }
+    /// Liest eine Dump-Datei aus [`MftReader::scan_with_dump`] statt des
+    /// Laufwerks - braucht keine Admin-Rechte
+    pub fn scan_dump<F>(path: &Path, progress_callback: F) -> Result<HashMap<u64, FileEntry>, MftError>
+    where
+        F: Fn(f32, &str),
+    {
+        let mut file = File::open(path)?;
+        let mut header = [0u8; DUMP_HEADER_SIZE];
+        file.read_exact(&mut header)?;
+        if &header[0..8] != DUMP_MAGIC {
+            return Err(MftError::ReadError(format!(
+                "{} ist keine MFT-Dump-Datei",
+                path.display()
+            )));
         }
+        let record_size = u32::from_le_bytes(header[8..12].try_into().unwrap()) as usize;
+        if record_size == 0 {
+            return Err(MftError::ReadError("Dump ohne Record-Größe".to_string()));
+        }
+        let total_records = (file.metadata()?.len().saturating_sub(DUMP_HEADER_SIZE as u64))
+            / record_size as u64;
 
-        let final_status = format!("{} Dateien/Ordner gefunden", entries.len());
-        progress_callback(1.0, &final_status);
+        let mut source = FileSource { file, record_size };
+        scan_source(&mut source, record_size, total_records, None, progress_callback)
+    }
 
-        Ok(entries)
+    /// Legt die Dump-Datei an und schreibt den Kopf
+    fn create_dump(path: &Path, record_size: usize) -> Result<BufWriter<File>, MftError> {
+        let mut writer = BufWriter::with_capacity(READ_CHUNK_SIZE, File::create(path)?);
+        let mut header = [0u8; DUMP_HEADER_SIZE];
+        header[0..8].copy_from_slice(DUMP_MAGIC);
+        header[8..12].copy_from_slice(&(record_size as u32).to_le_bytes());
+        writer.write_all(&header)?;
+        Ok(writer)
     }
 
     #[cfg(not(target_os = "windows"))]
@@ -305,6 +305,177 @@ impl MftReader {
             total_clusters: 0,
         })
     }
+}
+
+/// Woher die MFT-Records kommen: vom Laufwerk oder aus einer Dump-Datei
+///
+/// Liefert die MFT als fortlaufenden Bytestrom in Blöcken aus ganzen
+/// Records, unabhängig davon, wie sie auf der Platte verteilt ist.
+trait RecordSource {
+    /// Füllt den Puffer mit dem nächsten Block; 0 bedeutet Ende
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError>;
+}
+
+/// Liest die Fragmente der MFT vom Raw-Volume
+#[cfg(target_os = "windows")]
+struct VolumeSource<'a> {
+    volume: &'a Volume,
+    runs: Vec<DataRun>,
+    bytes_per_cluster: u64,
+    record_size: usize,
+    next_run: usize,
+    /// Nächste Leseposition auf der Platte (ungenutzt bei sparse Runs)
+    position: u64,
+    /// Verbleibende Bytes im aktuellen Run
+    remaining: u64,
+    sparse: bool,
+}
+
+#[cfg(target_os = "windows")]
+impl<'a> VolumeSource<'a> {
+    fn new(volume: &'a Volume, runs: Vec<DataRun>, bytes_per_cluster: u64, record_size: usize) -> Self {
+        Self {
+            volume,
+            runs,
+            bytes_per_cluster,
+            record_size,
+            next_run: 0,
+            position: 0,
+            remaining: 0,
+            sparse: false,
+        }
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl RecordSource for VolumeSource<'_> {
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError> {
+        loop {
+            if self.remaining == 0 {
+                // Nächstes Fragment
+                let Some(run) = self.runs.get(self.next_run) else {
+                    return Ok(0);
+                };
+                self.next_run += 1;
+                self.remaining = run.length * self.bytes_per_cluster;
+                match run.lcn {
+                    Some(lcn) => {
+                        self.sparse = false;
+                        self.position = lcn * self.bytes_per_cluster;
+                    }
+                    None => self.sparse = true,
+                }
+                continue;
+            }
+
+            let wanted = self.remaining.min(buffer.len() as u64) as usize;
+            if self.sparse {
+                // Kein Platz auf der Platte belegt: die Records gelten als leer
+                buffer[..wanted].fill(0);
+                self.remaining -= wanted as u64;
+                return Ok(wanted);
+            }
+
+            let got = self.volume.read_at(self.position, &mut buffer[..wanted])?;
+            let usable = got - got % self.record_size;
+            if usable == 0 {
+                return Ok(0); // Ende des Laufwerks oder Lesefehler
+            }
+            self.position += usable as u64;
+            self.remaining -= usable as u64;
+            return Ok(usable);
+        }
+    }
+}
+
+/// Liest eine Dump-Datei sequentiell
+struct FileSource {
+    file: File,
+    record_size: usize,
+}
+
+impl RecordSource for FileSource {
+    fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError> {
+        let mut filled = 0;
+        while filled < buffer.len() {
+            let got = self.file.read(&mut buffer[filled..])?;
+            if got == 0 {
+                break;
+            }
+            filled += got;
+        }
+        Ok(filled - filled % self.record_size)
+    }
+}
+
+/// Der eigentliche Scan: Records blockweise holen, Fixups anwenden, parsen
+///
+/// Die Record-Nummer läuft über alle Blöcke hinweg durch - sie ist die
+/// Position innerhalb der MFT, nicht auf der Platte.
+fn scan_source<F>(
+    source: &mut dyn RecordSource,
+    record_size: usize,
+    total_records: u64,
+    mut dump: Option<&mut BufWriter<File>>,
+    progress_callback: F,
+) -> Result<HashMap<u64, FileEntry>, MftError>
+where
+    F: Fn(f32, &str),
+{
+    let chunk_records = (READ_CHUNK_SIZE / record_size).max(1);
+    let mut buffer = vec![0u8; chunk_records * record_size];
+    let mut entries: HashMap<u64, FileEntry> = HashMap::new();
+    let mut mft_reference: u64 = 0;
+    let mut next_progress = PROGRESS_INTERVAL;
+
+    'chunks: while mft_reference < total_records {
+        let usable = source.read_chunk(&mut buffer)?;
+        if usable == 0 {
+            break;
+        }
+
+        // Rohdaten vor den Fixups sichern, damit der Dump der Platte entspricht
+        if let Some(dump) = dump.as_mut() {
+            dump.write_all(&buffer[..usable])?;
+        }
+
+        for record in buffer[..usable].chunks_exact_mut(record_size) {
+            if mft_reference >= total_records {
+                break 'chunks;
+            }
+
+            if MftParser::apply_fixups(record) {
+                if let Some(entry) = MftParser::parse_record(record, mft_reference) {
+                    // Systemdateien mit $ überspringen (optional)
+                    if !entry.name.starts_with('$') || entry.name == "$Recycle.Bin" {
+                        entries.insert(mft_reference, entry);
+                    }
+                }
+            }
+
+            mft_reference += 1;
+            if mft_reference >= next_progress {
+                next_progress += PROGRESS_INTERVAL;
+                let progress = (mft_reference as f32 / total_records as f32).min(0.99);
+                let status = format!(
+                    "{} von {} Records, {} Dateien/Ordner...",
+                    mft_reference,
+                    total_records,
+                    entries.len()
+                );
+                progress_callback(progress, &status);
+            }
+        }
+    }
+
+    if let Some(dump) = dump.as_mut() {
+        dump.flush()?;
+    }
+
+    let final_status = format!("{} Dateien/Ordner gefunden", entries.len());
+    progress_callback(1.0, &final_status);
+
+    Ok(entries)
 }
 
 /// Informationen aus dem NTFS Boot-Sektor

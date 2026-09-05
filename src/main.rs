@@ -34,6 +34,12 @@ struct Args {
     /// CLI-Modus ohne GUI
     #[arg(long)]
     cli: bool,
+
+    /// Rohe MFT-Records beim Scan in diese Datei schreiben (nur mit --cli).
+    /// `cargo run --release --example scan_bench -- <DATEI>` liest sie ohne
+    /// Admin-Rechte wieder ein, zum Messen von Parser und Baumaufbau.
+    #[arg(long, value_name = "DATEI", requires = "cli")]
+    dump_mft: Option<std::path::PathBuf>,
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -44,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
 
     if args.cli {
-        run_cli(args.drive)?;
+        run_cli(args.drive, args.dump_mft.as_deref())?;
     } else {
         run_gui()?;
     }
@@ -124,7 +130,7 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(window) = window_weak_thread.upgrade() {
                     match result {
-                        Ok(root_node) => {
+                        Ok((root_node, timings)) => {
                             // Baum speichern und GUI aktualisieren
                             let mut state = state_for_thread.lock().unwrap();
                             state.expanded_paths.clear();
@@ -141,8 +147,10 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                             window.set_tree_entries(entries_model.into());
 
                             window.set_status_text(SharedString::from(format!(
-                                "Fertig in {} - {} Dateien, {} Ordner",
+                                "Fertig in {} (Scan {}, Baum {}) - {} Dateien, {} Ordner",
                                 format_duration(elapsed),
+                                format_duration(timings.scan),
+                                format_duration(timings.tree),
                                 file_count,
                                 dir_count
                             )));
@@ -199,12 +207,24 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Dauer der beiden Scan-Phasen, getrennt gemessen
+struct ScanTimings {
+    /// MFT lesen und parsen
+    scan: std::time::Duration,
+    /// Verzeichnisbaum aufbauen
+    tree: std::time::Duration,
+}
+
 /// Führt den MFT-Scan in einem Background-Thread durch
-fn perform_scan_threaded(drive: &str, window_weak: slint::Weak<MainWindow>) -> Result<TreeNode, String> {
+fn perform_scan_threaded(
+    drive: &str,
+    window_weak: slint::Weak<MainWindow>,
+) -> Result<(TreeNode, ScanTimings), String> {
     // MFT-Reader erstellen
     let reader = MftReader::new(drive).map_err(|e| format!("{}", e))?;
 
     // Scan durchführen mit Progress-Updates via invoke_from_event_loop
+    let scan_started = std::time::Instant::now();
     let entries = reader
         .scan(|progress, status| {
             let window_weak_clone = window_weak.clone();
@@ -218,17 +238,27 @@ fn perform_scan_threaded(drive: &str, window_weak: slint::Weak<MainWindow>) -> R
         })
         .map_err(|e| format!("{}", e))?;
 
+    let scan = scan_started.elapsed();
+
     if entries.is_empty() {
         return Err("Keine Dateien gefunden. Admin-Rechte erforderlich!".to_string());
     }
 
     // Baum aufbauen
+    let tree_started = std::time::Instant::now();
     let builder = TreeBuilder::new(entries);
     let mut tree = builder.build();
     tree.name = drive.to_string();
     tree.path = drive.to_string();
+    let tree_time = tree_started.elapsed();
 
-    Ok(tree)
+    Ok((
+        tree,
+        ScanTimings {
+            scan,
+            tree: tree_time,
+        },
+    ))
 }
 
 /// Formatiert eine Dauer lesbar: "850 ms", "4,2 s", "1 min 12 s"
@@ -328,7 +358,10 @@ fn add_node_to_entries(
 }
 
 /// CLI-Modus ohne GUI
-fn run_cli(drive: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
+fn run_cli(
+    drive: Option<String>,
+    dump_mft: Option<&std::path::Path>,
+) -> Result<(), Box<dyn std::error::Error>> {
     let drive = drive.unwrap_or_else(|| "C:".to_string());
 
     println!("rustree - NTFS Disk Space Analyzer");
@@ -352,12 +385,17 @@ fn run_cli(drive: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     // Scan durchführen
     let started = std::time::Instant::now();
-    println!("Scanne MFT...");
-    let entries = reader.scan(|progress, status| {
+    if let Some(path) = dump_mft {
+        println!("Scanne MFT, Dump nach {}...", path.display());
+    } else {
+        println!("Scanne MFT...");
+    }
+    let entries = reader.scan_with_dump(dump_mft, |progress, status| {
         print!("\r{:.0}% - {}", progress * 100.0, status);
         use std::io::Write;
         std::io::stdout().flush().ok();
     })?;
+    let scan_time = started.elapsed();
 
     println!();
     println!();
@@ -369,8 +407,10 @@ fn run_cli(drive: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
 
     // Baum aufbauen
     println!("Baue Verzeichnisbaum...");
+    let tree_started = std::time::Instant::now();
     let builder = TreeBuilder::new(entries);
     let tree = builder.build();
+    let tree_time = tree_started.elapsed();
 
     // Debug: Zeige erste Kinder des Root
     println!();
@@ -414,7 +454,12 @@ fn run_cli(drive: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         tree.file_count, tree.dir_count
     );
     println!("Gesamtgröße: {}", format_size(tree.total_size));
-    println!("Fertig in {}", format_duration(started.elapsed()));
+    println!(
+        "Fertig in {} (Scan {}, Baum {})",
+        format_duration(started.elapsed()),
+        format_duration(scan_time),
+        format_duration(tree_time)
+    );
 
     Ok(())
 }
