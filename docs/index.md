@@ -55,9 +55,13 @@ rustree/
 ├── tests/
 │   └── ui_tests.rs      # Integration-Tests
 ├── docs/                # Diese Dokumentation
+├── installer/
+│   └── rustree.nsi      # NSIS-Setup (baut scripts/release.ps1)
+├── scripts/
+│   ├── update.ps1       # Bauen, installierte EXE ersetzen, neu starten
+│   └── release.ps1      # Gates, Release-Build, Setup
 ├── rustree.manifest     # Windows Admin-Manifest
-├── rustree.rc           # Windows Resource-File
-└── build.rs             # Build-Skript für Slint & Manifest
+└── build.rs             # Build-Skript für Slint, Manifest & Versionsinfo
 ```
 
 ## Los geht's!

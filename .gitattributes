@@ -1,0 +1,9 @@
+# Normalize every text file to LF, in the repository *and* in the working tree.
+# rustfmt expects LF, so a Windows checkout with core.autocrlf=true would
+# otherwise fail `cargo fmt --check` in scripts/release.ps1.
+* text=auto eol=lf
+
+# Binary assets must never be touched.
+*.png binary
+*.ico binary
+*.exe binary

@@ -32,7 +32,7 @@ Bei der Installation wähle "C++ Build Tools" aus.
 ## Projekt klonen/herunterladen
 
 ```powershell
-git clone https://github.com/dein-username/rustree.git
+git clone https://github.com/kmm-codes/rustree.git
 cd rustree
 ```
 
