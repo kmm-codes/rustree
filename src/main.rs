@@ -116,7 +116,9 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
 
         // MFT-Scan in Background-Thread durchführen
         std::thread::spawn(move || {
+            let started = std::time::Instant::now();
             let result = perform_scan_threaded(&drive_str, window_weak_thread.clone());
+            let elapsed = started.elapsed();
 
             // Ergebnis zurück an UI-Thread senden
             let _ = slint::invoke_from_event_loop(move || {
@@ -139,8 +141,10 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                             window.set_tree_entries(entries_model.into());
 
                             window.set_status_text(SharedString::from(format!(
-                                "Fertig - {} Dateien, {} Ordner",
-                                file_count, dir_count
+                                "Fertig in {} - {} Dateien, {} Ordner",
+                                format_duration(elapsed),
+                                file_count,
+                                dir_count
                             )));
                         }
                         Err(e) => {
@@ -225,6 +229,19 @@ fn perform_scan_threaded(drive: &str, window_weak: slint::Weak<MainWindow>) -> R
     tree.path = drive.to_string();
 
     Ok(tree)
+}
+
+/// Formatiert eine Dauer lesbar: "850 ms", "4,2 s", "1 min 12 s"
+fn format_duration(duration: std::time::Duration) -> String {
+    let secs = duration.as_secs_f64();
+    if secs < 1.0 {
+        format!("{} ms", duration.as_millis())
+    } else if secs < 60.0 {
+        format!("{:.1} s", secs).replace('.', ",")
+    } else {
+        let whole = duration.as_secs();
+        format!("{} min {} s", whole / 60, whole % 60)
+    }
 }
 
 /// Konvertiert den Baum in flache TreeEntry-Liste für die GUI
@@ -334,6 +351,7 @@ fn run_cli(drive: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     println!();
 
     // Scan durchführen
+    let started = std::time::Instant::now();
     println!("Scanne MFT...");
     let entries = reader.scan(|progress, status| {
         print!("\r{:.0}% - {}", progress * 100.0, status);
@@ -396,6 +414,7 @@ fn run_cli(drive: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
         tree.file_count, tree.dir_count
     );
     println!("Gesamtgröße: {}", format_size(tree.total_size));
+    println!("Fertig in {}", format_duration(started.elapsed()));
 
     Ok(())
 }
