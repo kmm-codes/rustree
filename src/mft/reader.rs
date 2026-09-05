@@ -20,6 +20,7 @@
 
 use super::parser::{attribute_types, DataRun, MftParser};
 use super::types::{FileEntry, MftError};
+use rayon::prelude::*;
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufWriter, Read, Write};
@@ -37,11 +38,10 @@ use windows::{
     },
 };
 
-/// Blockgröße beim Lesen der MFT; wird auf ganze Records gerundet
-const READ_CHUNK_SIZE: usize = 1024 * 1024;
-
-/// Fortschritt alle N Records melden
-const PROGRESS_INTERVAL: u64 = 16_384;
+/// Blockgröße beim Lesen der MFT; wird auf ganze Records gerundet. Groß
+/// genug, dass ein Lesezugriff die Platte auslastet, klein genug für zwei
+/// Puffer im Wechsel.
+const READ_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
 /// Kopf einer MFT-Dump-Datei: Magic (8), Record-Größe (u32), reserviert (u32)
 const DUMP_MAGIC: &[u8; 8] = b"RTMFTv1\0";
@@ -311,7 +311,9 @@ impl MftReader {
 ///
 /// Liefert die MFT als fortlaufenden Bytestrom in Blöcken aus ganzen
 /// Records, unabhängig davon, wie sie auf der Platte verteilt ist.
-trait RecordSource {
+/// `Send`, weil der nächste Block auf einem anderen Thread gelesen wird,
+/// während der aktuelle geparst wird.
+trait RecordSource: Send {
     /// Füllt den Puffer mit dem nächsten Block; 0 bedeutet Ende
     fn read_chunk(&mut self, buffer: &mut [u8]) -> Result<usize, MftError>;
 }
@@ -410,8 +412,10 @@ impl RecordSource for FileSource {
 
 /// Der eigentliche Scan: Records blockweise holen, Fixups anwenden, parsen
 ///
-/// Die Record-Nummer läuft über alle Blöcke hinweg durch - sie ist die
-/// Position innerhalb der MFT, nicht auf der Platte.
+/// Zwei Puffer im Wechsel: während ein Block geparst wird (parallel über
+/// alle Kerne, jeder Record ist unabhängig), liest ein zweiter Thread schon
+/// den nächsten von der Platte. Die Record-Nummer läuft über alle Blöcke
+/// hinweg durch - sie ist die Position innerhalb der MFT, nicht auf der Platte.
 fn scan_source<F>(
     source: &mut dyn RecordSource,
     record_size: usize,
@@ -423,49 +427,42 @@ where
     F: Fn(f32, &str),
 {
     let chunk_records = (READ_CHUNK_SIZE / record_size).max(1);
-    let mut buffer = vec![0u8; chunk_records * record_size];
-    let mut entries: HashMap<u64, FileEntry> = HashMap::new();
-    let mut mft_reference: u64 = 0;
-    let mut next_progress = PROGRESS_INTERVAL;
+    let mut current = vec![0u8; chunk_records * record_size];
+    let mut next = vec![0u8; chunk_records * record_size];
 
-    'chunks: while mft_reference < total_records {
-        let usable = source.read_chunk(&mut buffer)?;
-        if usable == 0 {
-            break;
-        }
+    // Fast jeder Record ist eine Datei oder ein Ordner; einmal reservieren
+    // erspart ein Dutzend Rehashes von Millionen Einträgen.
+    let mut entries: HashMap<u64, FileEntry> =
+        HashMap::with_capacity(total_records.min(50_000_000) as usize);
+    let mut first_reference: u64 = 0;
 
+    let mut usable = source.read_chunk(&mut current)?;
+    while usable > 0 && first_reference < total_records {
         // Rohdaten vor den Fixups sichern, damit der Dump der Platte entspricht
         if let Some(dump) = dump.as_mut() {
-            dump.write_all(&buffer[..usable])?;
+            dump.write_all(&current[..usable])?;
         }
 
-        for record in buffer[..usable].chunks_exact_mut(record_size) {
-            if mft_reference >= total_records {
-                break 'chunks;
-            }
+        let block = &mut current[..usable];
+        let (next_usable, parsed) = rayon::join(
+            || source.read_chunk(&mut next),
+            || parse_block(block, record_size, first_reference, total_records),
+        );
 
-            if MftParser::apply_fixups(record) {
-                if let Some(entry) = MftParser::parse_record(record, mft_reference) {
-                    // Systemdateien mit $ überspringen (optional)
-                    if !entry.name.starts_with('$') || entry.name == "$Recycle.Bin" {
-                        entries.insert(mft_reference, entry);
-                    }
-                }
-            }
+        entries.extend(parsed);
+        first_reference += (usable / record_size) as u64;
 
-            mft_reference += 1;
-            if mft_reference >= next_progress {
-                next_progress += PROGRESS_INTERVAL;
-                let progress = (mft_reference as f32 / total_records as f32).min(0.99);
-                let status = format!(
-                    "{} von {} Records, {} Dateien/Ordner...",
-                    mft_reference,
-                    total_records,
-                    entries.len()
-                );
-                progress_callback(progress, &status);
-            }
-        }
+        let progress = (first_reference as f32 / total_records as f32).min(0.99);
+        let status = format!(
+            "{} von {} Records, {} Dateien/Ordner...",
+            first_reference.min(total_records),
+            total_records,
+            entries.len()
+        );
+        progress_callback(progress, &status);
+
+        usable = next_usable?;
+        std::mem::swap(&mut current, &mut next);
     }
 
     if let Some(dump) = dump.as_mut() {
@@ -476,6 +473,32 @@ where
     progress_callback(1.0, &final_status);
 
     Ok(entries)
+}
+
+/// Parst einen Block Records parallel; Records jenseits von `total_records`
+/// (Rest des letzten Fragments) werden ignoriert
+fn parse_block(
+    block: &mut [u8],
+    record_size: usize,
+    first_reference: u64,
+    total_records: u64,
+) -> Vec<(u64, FileEntry)> {
+    block
+        .par_chunks_mut(record_size)
+        .enumerate()
+        .filter_map(|(index, record)| {
+            let mft_reference = first_reference + index as u64;
+            if mft_reference >= total_records || !MftParser::apply_fixups(record) {
+                return None;
+            }
+            let entry = MftParser::parse_record(record, mft_reference)?;
+            // Systemdateien mit $ überspringen (optional)
+            if entry.name.starts_with('$') && entry.name != "$Recycle.Bin" {
+                return None;
+            }
+            Some((mft_reference, entry))
+        })
+        .collect()
 }
 
 /// Informationen aus dem NTFS Boot-Sektor
@@ -536,6 +559,13 @@ impl Volume {
         Ok(bytes_read as usize)
     }
 }
+
+// SAFETY: ein Datei-Handle darf von jedem Thread benutzt werden; wir lesen
+// nur, und immer von genau einem Thread zur Zeit.
+#[cfg(target_os = "windows")]
+unsafe impl Send for Volume {}
+#[cfg(target_os = "windows")]
+unsafe impl Sync for Volume {}
 
 #[cfg(target_os = "windows")]
 impl Drop for Volume {
