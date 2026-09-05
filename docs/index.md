@@ -11,6 +11,9 @@ rustree ist ein Tool ähnlich wie WinDirStat oder TreeSize, aber:
 
 ## Aktueller Status
 
+Der laufende Stand wird über [GitHub Issues](https://github.com/kmm-codes/rustree/issues)
+und die [Milestones](https://github.com/kmm-codes/rustree/milestones) je Phase verfolgt.
+
 | Phase | Status | Beschreibung |
 |-------|--------|--------------|
 | 1. Projekt-Setup | ✅ Fertig | Cargo, Slint, Dependencies |
@@ -22,10 +25,10 @@ rustree ist ein Tool ähnlich wie WinDirStat oder TreeSize, aber:
 
 ### Letzte Änderungen
 
-- **Background-Threading**: MFT-Scan läuft jetzt im Hintergrund, UI friert nicht mehr ein
-- **Admin-Elevation**: App fordert automatisch Admin-Rechte an (Windows Manifest)
-- **Progress-Updates**: Fortschrittsanzeige während des Scans
-- **9 Unit-Tests**: Für TreeNode, TreeBuilder, format_size etc.
+- **Vollständiger MFT-Scan**: Der Reader folgt den Data Runs der `$MFT`, wendet Fixups an und bevorzugt lange Windows-Namen
+- **Baumliste**: Namen werden angezeigt und bei Platzmangel gekürzt, Skia-Renderer für saubere Schrift
+- **Setup und Dev-Loop**: `scripts/release.ps1` baut ein NSIS-Setup, `scripts/update.ps1` ersetzt die installierte EXE
+- **20 Unit-Tests**: Parser (Fixups, Data Runs, Namensauswahl), TreeNode, TreeBuilder, format_size
 
 ## Warum dieses Projekt?
 
