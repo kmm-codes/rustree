@@ -10,11 +10,15 @@
 //! # Die Schritte zum MFT-Lesen:
 //!
 //! 1. Laufwerk als Raw-Device öffnen
-//! 2. Boot-Sektor lesen (erste 512 Bytes)
-//! 3. Aus dem Boot-Sektor die MFT-Position ermitteln
-//! 4. MFT-Records sequentiell lesen
+//! 2. Boot-Sektor lesen (erste 512 Bytes): Sektor-, Cluster- und
+//!    Record-Größe sowie der Start-Cluster der MFT
+//! 3. Record 0 lesen - er beschreibt die MFT selbst. Sein `$DATA`-Attribut
+//!    listet die Data Runs (die Fragmente der MFT auf der Platte) und ihre
+//!    Gesamtgröße, aus der sich die Anzahl der Records ergibt
+//! 4. Fragment für Fragment in großen Blöcken lesen, jeden Record per Fixup
+//!    korrigieren und parsen
 
-use super::parser::MftParser;
+use super::parser::{attribute_types, MftParser};
 use super::types::{FileEntry, MftError};
 use std::collections::HashMap;
 
@@ -22,14 +26,19 @@ use std::collections::HashMap;
 use windows::{
     core::PCWSTR,
     Win32::{
-        Foundation::{HANDLE, CloseHandle, GENERIC_READ},
+        Foundation::{CloseHandle, GENERIC_READ, HANDLE},
         Storage::FileSystem::{
-            CreateFileW, FILE_SHARE_READ, FILE_SHARE_WRITE,
-            OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL,
-            ReadFile, SetFilePointerEx, FILE_BEGIN,
+            CreateFileW, ReadFile, SetFilePointerEx, FILE_ATTRIBUTE_NORMAL, FILE_BEGIN,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
         },
     },
 };
+
+/// Blockgröße beim Lesen der MFT; wird auf ganze Records gerundet
+const READ_CHUNK_SIZE: usize = 1024 * 1024;
+
+/// Fortschritt alle N Records melden
+const PROGRESS_INTERVAL: u64 = 16_384;
 
 /// Der MFT-Reader - liest die Master File Table direkt aus
 pub struct MftReader {
@@ -119,105 +128,98 @@ impl MftReader {
     where
         F: Fn(f32, &str),
     {
-        let mut entries = HashMap::new();
-
-        // Pfad zum Raw-Device
-        let path: Vec<u16> = format!("\\\\.\\{}", self.drive_letter)
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
-        // Laufwerk öffnen
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(path.as_ptr()),
-                GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                HANDLE::default(),
-            )?
-        };
-
-        // MFT-Position berechnen
-        let mft_offset = self.mft_start_cluster * self.bytes_per_cluster;
-
-        progress_callback(0.0, "Suche MFT...");
-
-        // Zur MFT seekenn
-        let mut new_pos = 0i64;
-        unsafe {
-            SetFilePointerEx(handle, mft_offset as i64, Some(&mut new_pos), FILE_BEGIN)?;
+        let record_size = self.bytes_per_mft_record as usize;
+        if record_size == 0 || self.bytes_per_cluster == 0 {
+            return Err(MftError::ReadError(
+                "Boot-Sektor liefert keine Record- oder Cluster-Größe".to_string(),
+            ));
         }
 
-        // Buffer für einen MFT-Record
-        let record_size = self.bytes_per_mft_record as usize;
-        let mut record_buffer = vec![0u8; record_size];
+        let volume = Volume::open(&self.drive_letter)?;
 
-        // Wir lesen in Batches für bessere Performance
-        // Die MFT-Größe ist unbekannt, wir lesen bis wir ungültige Records finden
+        // Schritt 3: Record 0 beschreibt die MFT selbst
+        progress_callback(0.0, "Lese $MFT-Record...");
+
+        let mut mft_record = vec![0u8; record_size];
+        let read = volume.read_at(self.mft_start_cluster * self.bytes_per_cluster, &mut mft_record)?;
+        if read != record_size || !MftParser::apply_fixups(&mut mft_record) {
+            return Err(MftError::InvalidRecord);
+        }
+
+        let data_attr = MftParser::attributes(&mft_record)
+            .find(|(attr_type, attr)| {
+                *attr_type == attribute_types::DATA && MftParser::attribute_name_length(attr) == 0
+            })
+            .map(|(_, attr)| attr)
+            .ok_or(MftError::InvalidRecord)?;
+        let runs = MftParser::parse_data_runs(data_attr).ok_or(MftError::InvalidRecord)?;
+        let mft_size = MftParser::nonresident_real_size(data_attr).ok_or(MftError::InvalidRecord)?;
+        let total_records = mft_size / record_size as u64;
+        if total_records == 0 {
+            return Err(MftError::InvalidRecord);
+        }
+
+        // Schritt 4: Fragmente nacheinander in großen Blöcken lesen. Die
+        // Record-Nummer läuft über alle Fragmente hinweg durch - sie ist die
+        // Position innerhalb der MFT-Datei, nicht auf der Platte.
+        let chunk_records = (READ_CHUNK_SIZE / record_size).max(1);
+        let mut buffer = vec![0u8; chunk_records * record_size];
+        let mut entries: HashMap<u64, FileEntry> = HashMap::new();
         let mut mft_reference: u64 = 0;
-        let mut valid_records = 0u64;
-        let mut invalid_count = 0;
-        let max_invalid = 100; // Nach 100 ungültigen Records stoppen
+        let mut next_progress = PROGRESS_INTERVAL;
 
-        // Schätzung für Progress (wird beim Lesen angepasst)
-        let estimated_records = 1_000_000u64; // Typische Größe
+        'runs: for run in &runs {
+            let run_bytes = run.length * self.bytes_per_cluster;
 
-        progress_callback(0.01, "Lese MFT-Records...");
-
-        loop {
-            // Record lesen
-            let mut bytes_read = 0u32;
-            let read_result = unsafe {
-                ReadFile(
-                    handle,
-                    Some(&mut record_buffer),
-                    Some(&mut bytes_read),
-                    None,
-                )
+            let Some(lcn) = run.lcn else {
+                // Sparse: kein Platz auf der Platte belegt, die Records gelten als leer
+                mft_reference += run_bytes / record_size as u64;
+                continue;
             };
 
-            // Lesefehler oder EOF
-            if read_result.is_err() || bytes_read == 0 {
-                break;
-            }
+            let mut position = lcn * self.bytes_per_cluster;
+            let mut remaining = run_bytes;
 
-            // Record parsen
-            if let Some(entry) = MftParser::parse_record(&record_buffer, mft_reference) {
-                // Systemdateien mit $ überspringen (optional)
-                if !entry.name.starts_with('$') || entry.name == "$Recycle.Bin" {
-                    entries.insert(entry.mft_reference, entry);
+            while remaining > 0 && mft_reference < total_records {
+                let wanted = remaining.min(buffer.len() as u64) as usize;
+                let got = volume.read_at(position, &mut buffer[..wanted])?;
+                let usable = got - got % record_size;
+                if usable == 0 {
+                    break 'runs; // Ende des Laufwerks oder Lesefehler
                 }
-                valid_records += 1;
-                invalid_count = 0; // Reset bei gültigem Record
-            } else {
-                // Ungültiger Record
-                invalid_count += 1;
-                if invalid_count >= max_invalid {
-                    // Wahrscheinlich Ende der MFT erreicht
-                    break;
+
+                for record in buffer[..usable].chunks_exact_mut(record_size) {
+                    if mft_reference >= total_records {
+                        break 'runs;
+                    }
+
+                    if MftParser::apply_fixups(record) {
+                        if let Some(entry) = MftParser::parse_record(record, mft_reference) {
+                            // Systemdateien mit $ überspringen (optional)
+                            if !entry.name.starts_with('$') || entry.name == "$Recycle.Bin" {
+                                entries.insert(mft_reference, entry);
+                            }
+                        }
+                    }
+
+                    mft_reference += 1;
+                    if mft_reference >= next_progress {
+                        next_progress += PROGRESS_INTERVAL;
+                        let progress = (mft_reference as f32 / total_records as f32).min(0.99);
+                        let status = format!(
+                            "{} von {} Records, {} Dateien/Ordner...",
+                            mft_reference,
+                            total_records,
+                            entries.len()
+                        );
+                        progress_callback(progress, &status);
+                    }
                 }
-            }
 
-            mft_reference += 1;
-
-            // Progress alle 10000 Records aktualisieren
-            if mft_reference % 10000 == 0 {
-                let progress = (mft_reference as f32 / estimated_records as f32).min(0.99);
-                let status = format!("{} Dateien gefunden...", valid_records);
-                progress_callback(progress, &status);
-            }
-
-            // Safety limit: Nach 10 Millionen Records aufhören
-            if mft_reference > 10_000_000 {
-                break;
+                position += usable as u64;
+                remaining -= usable as u64;
             }
         }
-
-        // Handle schließen
-        unsafe { CloseHandle(handle)?; }
 
         let final_status = format!("{} Dateien/Ordner gefunden", entries.len());
         progress_callback(1.0, &final_status);
@@ -238,53 +240,15 @@ impl MftReader {
     /// Liest den Boot-Sektor des NTFS-Volumes
     #[cfg(target_os = "windows")]
     fn read_boot_sector(drive: &str) -> Result<BootSectorInfo, MftError> {
-        // Pfad zum Raw-Device erstellen: \\.\C:
-        let path: Vec<u16> = format!("\\\\.\\{}", drive)
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-
         // Laufwerk öffnen (erfordert Admin-Rechte!)
-        let handle = unsafe {
-            CreateFileW(
-                PCWSTR(path.as_ptr()),
-                GENERIC_READ.0,
-                FILE_SHARE_READ | FILE_SHARE_WRITE,
-                None,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                HANDLE::default(),
-            )
-        };
-
-        let handle = match handle {
-            Ok(h) => h,
-            Err(e) => {
-                // Prüfe ob es ein Zugriffsfehler ist
-                if e.code().0 as u32 == 0x80070005 {
-                    return Err(MftError::AccessDenied);
-                }
-                return Err(MftError::WindowsError(e));
-            }
-        };
+        let volume = Volume::open(drive)?;
 
         // Boot-Sektor ist die ersten 512 Bytes
         let mut buffer = vec![0u8; 512];
-        let mut bytes_read = 0u32;
-
-        let read_result = unsafe {
-            ReadFile(
-                handle,
-                Some(&mut buffer),
-                Some(&mut bytes_read),
-                None,
-            )
-        };
-
-        // Handle schließen
-        let _ = unsafe { CloseHandle(handle) };
-
-        read_result?;
+        let read = volume.read_at(0, &mut buffer)?;
+        if read < 512 {
+            return Err(MftError::ReadError("Boot-Sektor unvollständig".to_string()));
+        }
 
         // NTFS-Signatur prüfen (Bytes 3-7 sollten "NTFS" sein)
         if &buffer[3..7] != b"NTFS" {
@@ -295,14 +259,22 @@ impl MftReader {
         // Siehe: https://docs.microsoft.com/en-us/windows/win32/fileio/ntfs-technical-reference
 
         let bytes_per_sector = u16::from_le_bytes([buffer[11], buffer[12]]) as u32;
-        let sectors_per_cluster = buffer[13] as u32;
+
+        // Sektoren pro Cluster: Werte über 128 sind als 2^(256 - n) kodiert
+        // (große Cluster ab 128 KiB, seit Windows 10 1709)
+        let sectors_per_cluster = match buffer[13] {
+            0 => return Err(MftError::ReadError("Cluster-Größe 0".to_string())),
+            n if n > 128 => 1u32 << (256 - n as u32),
+            n => n as u32,
+        };
+
         let mft_start_cluster = u64::from_le_bytes([
-            buffer[48], buffer[49], buffer[50], buffer[51],
-            buffer[52], buffer[53], buffer[54], buffer[55],
+            buffer[48], buffer[49], buffer[50], buffer[51], buffer[52], buffer[53], buffer[54],
+            buffer[55],
         ]);
         let total_sectors = u64::from_le_bytes([
-            buffer[40], buffer[41], buffer[42], buffer[43],
-            buffer[44], buffer[45], buffer[46], buffer[47],
+            buffer[40], buffer[41], buffer[42], buffer[43], buffer[44], buffer[45], buffer[46],
+            buffer[47],
         ]);
 
         // Bytes per MFT Record (kann negativ sein als Log2)
@@ -342,6 +314,65 @@ struct BootSectorInfo {
     bytes_per_mft_record: u32,
     mft_start_cluster: u64,
     total_clusters: u64,
+}
+
+/// Ein geöffnetes Raw-Volume; das Handle wird beim Drop geschlossen
+#[cfg(target_os = "windows")]
+struct Volume {
+    handle: HANDLE,
+}
+
+#[cfg(target_os = "windows")]
+impl Volume {
+    /// Öffnet `\\.\<Laufwerk>` lesend (erfordert Admin-Rechte)
+    fn open(drive_letter: &str) -> Result<Self, MftError> {
+        let path: Vec<u16> = format!("\\\\.\\{}", drive_letter)
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+
+        let handle = unsafe {
+            CreateFileW(
+                PCWSTR(path.as_ptr()),
+                GENERIC_READ.0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                None,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                HANDLE::default(),
+            )
+        };
+
+        match handle {
+            Ok(handle) => Ok(Self { handle }),
+            // HRESULT aus Win32-Fehlern: 0x8007xxxx, untere 16 Bit = Fehlercode
+            Err(e) if e.code().0 as u32 == 0x8007_0005 => Err(MftError::AccessDenied),
+            Err(e) if matches!(e.code().0 as u32, 0x8007_0002 | 0x8007_0003) => {
+                Err(MftError::DriveNotFound(drive_letter.to_string()))
+            }
+            Err(e) => Err(MftError::WindowsError(e)),
+        }
+    }
+
+    /// Liest an einer absoluten Byte-Position; Offset und Länge müssen
+    /// Vielfache der Sektorgröße sein (Raw-Device)
+    fn read_at(&self, offset: u64, buffer: &mut [u8]) -> Result<usize, MftError> {
+        let mut bytes_read = 0u32;
+        unsafe {
+            SetFilePointerEx(self.handle, offset as i64, None, FILE_BEGIN)?;
+            ReadFile(self.handle, Some(buffer), Some(&mut bytes_read), None)?;
+        }
+        Ok(bytes_read as usize)
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl Drop for Volume {
+    fn drop(&mut self) {
+        unsafe {
+            let _ = CloseHandle(self.handle);
+        }
+    }
 }
 
 #[cfg(test)]
