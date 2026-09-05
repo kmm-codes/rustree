@@ -71,10 +71,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// einem Administrator-Terminal heraus klappt es.
 #[cfg(target_os = "windows")]
 fn attach_parent_console() {
-    use windows::Win32::System::Console::{AttachConsole, ATTACH_PARENT_PROCESS};
+    use windows::Win32::System::Console::{
+        AttachConsole, GetStdHandle, ATTACH_PARENT_PROCESS, STD_OUTPUT_HANDLE,
+    };
 
-    // SAFETY: reiner Win32-Aufruf ohne Zeiger; ein Fehlschlag ist erlaubt.
+    // SAFETY: reine Win32-Aufrufe ohne Zeiger; ein Fehlschlag ist erlaubt.
     unsafe {
+        // Ist die Ausgabe bereits umgeleitet (`rustree --cli > log`), hat der
+        // Prozess ein Handle geerbt - das darf AttachConsole nicht ersetzen.
+        if GetStdHandle(STD_OUTPUT_HANDLE).is_ok_and(|handle| !handle.is_invalid()) {
+            return;
+        }
         let _ = AttachConsole(ATTACH_PARENT_PROCESS);
     }
 }
@@ -82,7 +89,8 @@ fn attach_parent_console() {
 /// Globaler State für Thread-Sicherheit
 struct AppState {
     tree: Option<TreeNode>,
-    expanded_paths: HashSet<String>,
+    /// IDs (MFT-Referenzen) der aufgeklappten Ordner
+    expanded: HashSet<u64>,
 }
 
 /// Startet die grafische Benutzeroberfläche
@@ -103,7 +111,7 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
     // Thread-sicherer Speicher für den aktuellen Baum
     let app_state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
         tree: None,
-        expanded_paths: HashSet::new(),
+        expanded: HashSet::new(),
     }));
 
     // Scan-Callback mit Background-Thread
@@ -133,9 +141,9 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                         Ok((root_node, timings)) => {
                             // Baum speichern und GUI aktualisieren
                             let mut state = state_for_thread.lock().unwrap();
-                            state.expanded_paths.clear();
+                            state.expanded.clear();
 
-                            let entries = tree_to_entries(&root_node, &state.expanded_paths, 0);
+                            let entries = tree_to_entries(&root_node, &state.expanded);
                             let file_count = root_node.file_count;
                             let dir_count = root_node.dir_count;
 
@@ -175,32 +183,30 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         let window = window_weak.unwrap();
         let mut state = state_clone.lock().unwrap();
 
-        // Tree klonen um borrow-Konflikte zu vermeiden
-        let tree_clone = state.tree.clone();
+        // Baum und Klapp-Zustand getrennt ausleihen - der Baum wird nur
+        // gelesen, nie kopiert (bei Millionen Knoten wäre ein Klon pro
+        // Klick spürbar)
+        let AppState { tree, expanded } = &mut *state;
+        let Some(tree) = tree.as_ref() else {
+            return;
+        };
 
-        if let Some(ref tree) = tree_clone {
-            // Finde den Pfad des geklickten Eintrags anhand des Index
-            let paths = collect_visible_paths(tree, &state.expanded_paths, 0);
+        // Finde die ID des geklickten Eintrags anhand des Index
+        let visible = collect_visible_ids(tree, expanded);
+        let Some(&clicked) = visible.get(index as usize) else {
+            return;
+        };
 
-            if let Some(clicked_path) = paths.get(index as usize) {
-                let clicked_path = clicked_path.clone();
-
-                // Toggle expanded state
-                if state.expanded_paths.contains(&clicked_path) {
-                    state.expanded_paths.remove(&clicked_path);
-                } else {
-                    state.expanded_paths.insert(clicked_path);
-                }
-
-                // GUI aktualisieren
-                let new_entries = tree_to_entries(tree, &state.expanded_paths, 0);
-                drop(state);
-
-                let entries_model: Rc<slint::VecModel<TreeEntry>> =
-                    Rc::new(slint::VecModel::from(new_entries));
-                window.set_tree_entries(entries_model.into());
-            }
+        // Toggle expanded state
+        if !expanded.remove(&clicked) {
+            expanded.insert(clicked);
         }
+
+        // GUI aktualisieren
+        let new_entries = tree_to_entries(tree, expanded);
+        let entries_model: Rc<slint::VecModel<TreeEntry>> =
+            Rc::new(slint::VecModel::from(new_entries));
+        window.set_tree_entries(entries_model.into());
     });
 
     main_window.run()?;
@@ -249,7 +255,6 @@ fn perform_scan_threaded(
     let builder = TreeBuilder::new(entries);
     let mut tree = builder.build();
     tree.name = drive.to_string();
-    tree.path = drive.to_string();
     let tree_time = tree_started.elapsed();
 
     Ok((
@@ -275,55 +280,32 @@ fn format_duration(duration: std::time::Duration) -> String {
 }
 
 /// Konvertiert den Baum in flache TreeEntry-Liste für die GUI
-fn tree_to_entries(
-    node: &TreeNode,
-    expanded: &HashSet<String>,
-    depth: i32,
-) -> Vec<TreeEntry> {
+///
+/// Nur die Kinder der Wurzel und darunter die aufgeklappten Ordner.
+fn tree_to_entries(root: &TreeNode, expanded: &HashSet<u64>) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
-
-    // Nur Root-Kinder anzeigen (nicht den Root selbst)
-    if depth == 0 {
-        for child in &node.children {
-            add_node_to_entries(child, expanded, 0, &mut entries);
-        }
+    for child in &root.children {
+        add_node_to_entries(child, expanded, 0, &mut entries);
     }
-
     entries
 }
 
-/// Sammelt die sichtbaren Pfade in der gleichen Reihenfolge wie tree_to_entries
-fn collect_visible_paths(
-    node: &TreeNode,
-    expanded: &HashSet<String>,
-    depth: i32,
-) -> Vec<String> {
-    let mut paths = Vec::new();
-
-    if depth == 0 {
-        for child in &node.children {
-            collect_node_paths(child, expanded, 0, &mut paths);
-        }
+/// Sammelt die IDs der sichtbaren Knoten in der gleichen Reihenfolge wie
+/// tree_to_entries, um einen Listen-Index einem Knoten zuzuordnen
+fn collect_visible_ids(root: &TreeNode, expanded: &HashSet<u64>) -> Vec<u64> {
+    let mut ids = Vec::new();
+    for child in &root.children {
+        collect_node_ids(child, expanded, &mut ids);
     }
-
-    paths
+    ids
 }
 
-/// Rekursive Hilfsfunktion für collect_visible_paths
-fn collect_node_paths(
-    node: &TreeNode,
-    expanded: &HashSet<String>,
-    depth: i32,
-    paths: &mut Vec<String>,
-) {
-    let node_path = if node.path.is_empty() { &node.name } else { &node.path };
-    let is_expanded = expanded.contains(node_path);
-
-    paths.push(node_path.clone());
-
-    if is_expanded && node.is_directory {
+/// Rekursive Hilfsfunktion für collect_visible_ids
+fn collect_node_ids(node: &TreeNode, expanded: &HashSet<u64>, ids: &mut Vec<u64>) {
+    ids.push(node.id);
+    if node.is_directory && expanded.contains(&node.id) {
         for child in &node.children {
-            collect_node_paths(child, expanded, depth + 1, paths);
+            collect_node_ids(child, expanded, ids);
         }
     }
 }
@@ -331,13 +313,11 @@ fn collect_node_paths(
 /// Rekursive Hilfsfunktion für tree_to_entries
 fn add_node_to_entries(
     node: &TreeNode,
-    expanded: &HashSet<String>,
+    expanded: &HashSet<u64>,
     depth: i32,
     entries: &mut Vec<TreeEntry>,
 ) {
-    // Verwende path für expanded-Check, name für Anzeige
-    let node_path = if node.path.is_empty() { &node.name } else { &node.path };
-    let is_expanded = expanded.contains(node_path);
+    let is_expanded = node.is_directory && expanded.contains(&node.id);
 
     entries.push(TreeEntry {
         name: SharedString::from(&node.name),
@@ -350,7 +330,7 @@ fn add_node_to_entries(
     });
 
     // Kinder hinzufügen wenn expanded
-    if is_expanded && node.is_directory {
+    if is_expanded {
         for child in &node.children {
             add_node_to_entries(child, expanded, depth + 1, entries);
         }
@@ -418,11 +398,10 @@ fn run_cli(
     println!("─────────────────────────────────────────────────");
     for (i, child) in tree.children.iter().take(10).enumerate() {
         println!(
-            "{:2}. [{}] Name='{}' Path='{}' Size={}",
+            "{:2}. [{}] {:<40} {}",
             i + 1,
-            if child.is_directory { "DIR" } else { "FILE" },
+            if child.is_directory { "DIR " } else { "FILE" },
             child.name,
-            child.path,
             format_size(child.total_size)
         );
     }
@@ -440,11 +419,7 @@ fn run_cli(
             i + 1,
             icon,
             format_size(item.total_size),
-            if item.path.is_empty() {
-                &item.name
-            } else {
-                &item.path
-            }
+            item.path
         );
     }
 

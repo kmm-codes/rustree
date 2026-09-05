@@ -2,17 +2,22 @@
 //!
 //! Jeder Knoten repräsentiert entweder eine Datei oder einen Ordner.
 //! Ordner haben Kinder (children), die rekursiv die Baumstruktur bilden.
+//!
+//! Bewusst schlank: bei Millionen Knoten zählt jedes Feld. Der volle Pfad
+//! wird nicht gespeichert, sondern bei Bedarf aus dem Weg durch den Baum
+//! gebildet (siehe [`crate::tree::TreeBuilder::top_n`]).
 
 use std::cmp::Ordering;
 
 /// Ein Knoten im Verzeichnisbaum
 #[derive(Debug, Clone)]
 pub struct TreeNode {
+    /// MFT-Referenz des Eintrags - eindeutig pro Laufwerk, 0 wenn unbekannt.
+    /// Die GUI merkt sich darüber, welche Ordner aufgeklappt sind.
+    pub id: u64,
+
     /// Name der Datei/des Ordners
     pub name: String,
-
-    /// Voller Pfad (wird beim Traversieren aufgebaut)
-    pub path: String,
 
     /// Eigene Größe in Bytes (für Dateien)
     pub own_size: u64,
@@ -37,8 +42,8 @@ impl TreeNode {
     /// Erstellt einen neuen Datei-Knoten
     pub fn new_file(name: String, size: u64) -> Self {
         Self {
+            id: 0,
             name,
-            path: String::new(),
             own_size: size,
             total_size: size,
             is_directory: false,
@@ -51,8 +56,8 @@ impl TreeNode {
     /// Erstellt einen neuen Ordner-Knoten
     pub fn new_directory(name: String) -> Self {
         Self {
+            id: 0,
             name,
-            path: String::new(),
             own_size: 0,
             total_size: 0,
             is_directory: true,
@@ -70,13 +75,13 @@ impl TreeNode {
         self.children.push(child);
     }
 
-    /// Sortiert die Kinder nach Größe (größte zuerst)
+    /// Sortiert die Kinder nach Größe (größte zuerst), rekursiv für den
+    /// ganzen Teilbaum. Einmal an der Wurzel aufrufen, nicht pro Ebene:
+    /// sonst wird jeder Ordner so oft sortiert, wie er tief liegt.
     pub fn sort_by_size(&mut self) {
-        self.children.sort_by(|a, b| {
-            b.total_size.cmp(&a.total_size)
-        });
+        self.children
+            .sort_unstable_by(|a, b| b.total_size.cmp(&a.total_size));
 
-        // Rekursiv auch alle Kindknoten sortieren
         for child in &mut self.children {
             if child.is_directory {
                 child.sort_by_size();
