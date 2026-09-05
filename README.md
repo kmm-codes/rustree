@@ -62,6 +62,21 @@ von Tauri unter `%LOCALAPPDATA%\tauri\NSIS` gesucht; sonst
 Neue Version: `version` in `Cargo.toml` erhöhen, committen und den Commit mit
 `v<version>` taggen.
 
+## Messen ohne Admin-Rechte
+
+Ein einmaliger Lauf als Administrator schreibt die rohen MFT-Records in eine
+Datei; danach lassen sich Parser und Baumaufbau beliebig oft ohne Elevation
+messen (Examples bekommen kein Admin-Manifest):
+
+```powershell
+rustree --cli --drive C: --dump-mft F:\dev\mft-c.bin          # als Administrator
+cargo run --release --example scan_bench -- F:\dev\mft-c.bin 3 # drei Läufe
+cargo run --example ui_preview                                 # GUI mit Beispieldaten
+```
+
+Die Statuszeile der GUI und die CLI zeigen die Dauer getrennt nach Scan
+(MFT lesen und parsen) und Baum (Verzeichnisbaum aufbauen).
+
 ## Aufbau
 
 ```
@@ -73,6 +88,7 @@ rustree/
     tree/             Baum-Datenstruktur mit Größenaggregation
   ui/main.slint       GUI-Definition (Slint)
   tests/              Integrationstests
+  examples/           ui_preview (GUI ohne Scan), scan_bench (MFT-Dump messen)
   installer/          NSIS-Setup (rustree.nsi)
   scripts/            update.ps1, release.ps1
   docs/               mkdocs-Dokumentation
