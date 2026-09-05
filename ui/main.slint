@@ -1,0 +1,190 @@
+// rustree - NTFS Disk Space Analyzer
+// Hauptfenster mit Baumansicht und Treemap
+
+import { Button, VerticalBox, HorizontalBox, ListView, ComboBox, ProgressIndicator } from "std-widgets.slint";
+
+// Ein Eintrag im Verzeichnisbaum
+// Hinweis: size_bytes ist float weil Slint kein i64 hat
+export struct TreeEntry {
+    name: string,
+    size: string,
+    size_bytes: float,
+    is_directory: bool,
+    depth: int,
+    expanded: bool,
+    has_children: bool,
+}
+
+// Hauptfenster
+export component MainWindow inherits Window {
+    title: "rustree - Disk Space Analyzer";
+    min-width: 1024px;
+    min-height: 768px;
+    background: #1e1e2e;
+
+    // Properties die von Rust gesetzt werden
+    in-out property <[string]> available_drives: ["C:", "D:", "E:"];
+    in-out property <int> selected_drive_index: 0;
+    in-out property <[TreeEntry]> tree_entries: [];
+    in-out property <float> scan_progress: 0.0;
+    in-out property <bool> is_scanning: false;
+    in-out property <string> status_text: "Bereit";
+
+    // Callbacks nach Rust
+    callback scan_drive(string);
+    callback toggle_entry(int);
+
+    VerticalBox {
+        padding: 16px;
+        spacing: 12px;
+
+        // Header mit Drive-Auswahl
+        HorizontalBox {
+            spacing: 12px;
+            height: 40px;
+
+            Text {
+                text: "Laufwerk:";
+                color: #cdd6f4;
+                vertical-alignment: center;
+            }
+
+            ComboBox {
+                model: available_drives;
+                current-index <=> selected_drive_index;
+                width: 100px;
+            }
+
+            Button {
+                text: is_scanning ? "Scanne..." : "Scannen";
+                enabled: !is_scanning;
+                clicked => {
+                    scan_drive(available_drives[selected_drive_index]);
+                }
+            }
+
+            Rectangle {
+                horizontal-stretch: 1;
+            }
+
+            Text {
+                text: status_text;
+                color: #a6adc8;
+                vertical-alignment: center;
+            }
+        }
+
+        // Progress Bar (nur sichtbar beim Scannen)
+        if is_scanning: ProgressIndicator {
+            progress: scan_progress;
+            height: 8px;
+        }
+
+        // Hauptbereich: Baumansicht links, Treemap rechts
+        HorizontalBox {
+            spacing: 12px;
+            vertical-stretch: 1;
+
+            // Baumansicht
+            Rectangle {
+                background: #313244;
+                border-radius: 8px;
+                width: 45%;
+
+                VerticalBox {
+                    padding: 8px;
+
+                    Text {
+                        text: "Verzeichnisse";
+                        color: #cdd6f4;
+                        font-size: 14px;
+                        font-weight: 600;
+                    }
+
+                    ListView {
+                        for entry[index] in tree_entries: Rectangle {
+                            height: 28px;
+                            background: touch.has-hover ? #45475a : transparent;
+
+                            touch := TouchArea {
+                                clicked => {
+                                    toggle_entry(index);
+                                }
+                            }
+
+                            HorizontalBox {
+                                padding-left: entry.depth * 20px + 8px;
+                                spacing: 8px;
+
+                                // Expand/Collapse Icon
+                                Text {
+                                    text: entry.has_children ? (entry.expanded ? "▼" : "▶") : "  ";
+                                    color: #89b4fa;
+                                    width: 16px;
+                                    vertical-alignment: center;
+                                }
+
+                                // Ordner/Datei Icon
+                                Text {
+                                    text: entry.is_directory ? "📁" : "📄";
+                                    width: 20px;
+                                    vertical-alignment: center;
+                                }
+
+                                // Name
+                                Text {
+                                    text: entry.name;
+                                    color: entry.is_directory ? #89dceb : #cdd6f4;
+                                    horizontal-stretch: 1;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+
+                                // Größe
+                                Text {
+                                    text: entry.size;
+                                    color: #f9e2af;
+                                    horizontal-alignment: right;
+                                    width: 80px;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Treemap Bereich
+            Rectangle {
+                background: #313244;
+                border-radius: 8px;
+                horizontal-stretch: 1;
+
+                VerticalBox {
+                    padding: 8px;
+
+                    Text {
+                        text: "Treemap";
+                        color: #cdd6f4;
+                        font-size: 14px;
+                        font-weight: 600;
+                    }
+
+                    // Placeholder für Treemap (wird später implementiert)
+                    Rectangle {
+                        background: #1e1e2e;
+                        border-radius: 4px;
+                        vertical-stretch: 1;
+
+                        Text {
+                            text: tree_entries.length > 0 ? "Treemap Visualisierung\n(Phase 5)" : "Starte einen Scan...";
+                            color: #6c7086;
+                            horizontal-alignment: center;
+                            vertical-alignment: center;
+                        }
+                    }
+                }
+            }
+        }
+    }
+}

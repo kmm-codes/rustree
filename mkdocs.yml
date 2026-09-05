@@ -1,0 +1,61 @@
+site_name: rustree Dokumentation
+site_description: Lerne Rust mit einem echten Disk Space Analyzer Projekt
+site_author: Kevin
+
+theme:
+  name: material
+  language: de
+  palette:
+    - scheme: slate
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-4
+        name: Zum hellen Modus wechseln
+    - scheme: default
+      primary: deep purple
+      accent: amber
+      toggle:
+        icon: material/brightness-7
+        name: Zum dunklen Modus wechseln
+  features:
+    - navigation.tabs
+    - navigation.sections
+    - navigation.expand
+    - navigation.top
+    - search.highlight
+    - content.code.copy
+
+nav:
+  - Start: index.md
+  - Erste Schritte:
+    - Installation: getting-started/installation.md
+    - Erster Start: getting-started/first-run.md
+  - Architektur:
+    - Übersicht: architecture/overview.md
+    - MFT verstehen: architecture/mft.md
+  - Rust-Konzepte:
+    - Ownership: rust-concepts/ownership.md
+    - Error Handling: rust-concepts/errors.md
+    - Traits: rust-concepts/traits.md
+    - Threading: rust-concepts/threading.md
+
+markdown_extensions:
+  - pymdownx.highlight:
+      anchor_linenums: true
+  - pymdownx.superfences
+  - pymdownx.tabbed:
+      alternate_style: true
+  - admonition
+  - pymdownx.details
+  - attr_list
+  - md_in_html
+  - tables
+
+plugins:
+  - search
+
+extra:
+  social:
+    - icon: fontawesome/brands/github
+      link: https://github.com/dein-username/rustree
