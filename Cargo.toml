@@ -36,8 +36,13 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_System_Ioctl",
     "Win32_Security",
-    "Win32_System_Console"
+    "Win32_System_Console",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging"
 ]}
+
+# Nativer Ordner-Dialog (IFileDialog) für "Ordner wählen"
+rfd = "0.15"
 
 # CLI parsing
 clap = { version = "4", features = ["derive"] }

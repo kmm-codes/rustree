@@ -3,7 +3,13 @@
 Schneller NTFS Disk Space Analyzer für Windows, geschrieben in Rust mit einer
 Slint-GUI. Statt den Verzeichnisbaum rekursiv zu durchlaufen, liest rustree die
 Master File Table (MFT) direkt und baut daraus den Größenbaum. Dafür braucht es
-Administrator-Rechte, die die EXE per Manifest selbst anfordert.
+Administrator-Rechte: die App fragt beim Start danach und startet sich dann
+selbst mit Rechten neu (wie WinDirStat), das Manifest erzwingt nichts.
+
+Beim Start zeigt sie die lokalen Laufwerke mit Belegung; ein Klick darauf
+oder auf "Ordner wählen..." startet den Scan sofort, ebenso jeder Wechsel
+des Laufwerks in der Kopfzeile. Auch für einen Ordner wird die ganze MFT
+gelesen (Sekunden), gezeigt wird dann der Teilbaum.
 
 Das Projekt ist zugleich ein Rust-Lernprojekt: der Code ist ausführlich
 kommentiert, die Dokumentation unter `docs/` (mkdocs) erklärt Architektur und
@@ -16,7 +22,8 @@ Voraussetzungen: Rust (rustup) und die Visual Studio Build Tools (C++), siehe
 
 ```powershell
 cargo build                                # Debug-Build
-cargo run --release                        # GUI, fordert Admin-Rechte an
+cargo run --release                        # GUI, fragt nach Admin-Rechten
+cargo run --release -- --drive D:          # GUI, scannt D: sofort
 cargo run --release -- --cli --drive C:    # CLI-Modus
 cargo test
 ```
@@ -98,7 +105,7 @@ rustree/
   installer/          NSIS-Setup (rustree.nsi)
   scripts/            update.ps1, release.ps1
   docs/               mkdocs-Dokumentation
-  rustree.manifest    Windows-Manifest: Admin-Elevation, DPI-Awareness
+  rustree.manifest    Windows-Manifest: DPI-Awareness (keine erzwungene Elevation)
   build.rs            Slint kompilieren, Manifest und Versionsinfo einbetten
 ```
 

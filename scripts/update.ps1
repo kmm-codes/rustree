@@ -12,8 +12,8 @@
 # and the "Apps" uninstall entry of the setup stay valid. Without a prior setup
 # the script creates the directory and a Start-menu shortcut itself.
 #
-# rustree runs elevated (rustree.manifest requests administrator rights), and
-# only an elevated process can stop such an instance. The build therefore runs
+# rustree runs elevated (it relaunches itself with administrator rights on
+# start), and only an elevated process can stop such an instance. The build runs
 # as the current user; when an instance has to be stopped, the
 # stop-replace-relaunch step re-runs this script elevated behind one UAC
 # prompt, and the relaunched app inherits those rights. When nothing is
@@ -193,8 +193,8 @@ function Invoke-Install($Source, $Installed) {
   }
 
   if (-not $NoLaunch) {
-    # Elevated here: the app inherits the rights its manifest asks for. Not
-    # elevated: Windows shows the app's own UAC prompt, as from the Start menu.
+    # Elevated here: the app inherits the rights and skips its own prompt.
+    # Not elevated: the app asks and relaunches itself, as from the Start menu.
     Write-Step 'starting the updated app'
     Start-Process -FilePath $destExe -WorkingDirectory $installDir
   }

@@ -11,9 +11,10 @@
 use clap::Parser;
 use rustree::mft::MftReader;
 use rustree::tree::{format_size, TreeBuilder, TreeNode};
-use rustree::treemap::Treemap;
+use rustree::treemap::{Bounds, Treemap};
 use slint::{Image, Model, Rgb8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
 use std::collections::HashSet;
+use std::path::{Component, Path, Prefix};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -26,7 +27,7 @@ slint::include_modules!();
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Laufwerk zum Scannen (z.B. C:)
+    /// Laufwerk zum Scannen (z.B. C:); in der GUI startet der Scan sofort
     #[arg(short, long)]
     drive: Option<String>,
 
@@ -51,7 +52,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if args.cli {
         run_cli(args.drive, args.dump_mft.as_deref())?;
     } else {
-        run_gui()?;
+        // Wie WinDirStat: ohne Administratorrechte erst fragen und sich
+        // dann selbst neu starten - das Manifest erzwingt nichts
+        #[cfg(target_os = "windows")]
+        if !is_elevated() && relaunch_elevated() {
+            return Ok(());
+        }
+        run_gui(args.drive)?;
     }
 
     Ok(())
@@ -85,6 +92,77 @@ fn attach_parent_console() {
     }
 }
 
+/// Läuft der Prozess mit Administratorrechten?
+#[cfg(target_os = "windows")]
+fn is_elevated() -> bool {
+    use windows::Win32::UI::Shell::IsUserAnAdmin;
+
+    // SAFETY: reiner Win32-Aufruf ohne Argumente
+    unsafe { IsUserAnAdmin().as_bool() }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_elevated() -> bool {
+    true
+}
+
+/// Fragt, ob das Programm mit Administratorrechten neu gestartet werden
+/// soll, und tut es über den UAC-Dialog. `true` heißt: der neue Prozess
+/// läuft, dieser hier soll sich beenden. Bei "Nein" oder abgelehntem UAC
+/// geht es ohne Rechte weiter - dann scheitert der Scan mit einer Meldung.
+#[cfg(target_os = "windows")]
+fn relaunch_elevated() -> bool {
+    use windows::core::{HSTRING, PCWSTR};
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::Shell::ShellExecuteW;
+    use windows::Win32::UI::WindowsAndMessaging::{
+        MessageBoxW, IDYES, MB_ICONQUESTION, MB_YESNO, SW_SHOWNORMAL,
+    };
+
+    let question = HSTRING::from(
+        "rustree liest die Master File Table des Laufwerks direkt - das geht nur \
+         mit Administratorrechten.\n\nJetzt mit Administratorrechten neu starten?",
+    );
+    let title = HSTRING::from("rustree");
+    // SAFETY: gültige, nullterminierte Strings; kein Elternfenster nötig
+    let answer = unsafe { MessageBoxW(HWND::default(), &question, &title, MB_YESNO | MB_ICONQUESTION) };
+    if answer != IDYES {
+        return false;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        return false;
+    };
+    let parameters: Vec<String> = std::env::args().skip(1).map(quote_argument).collect();
+    let exe = HSTRING::from(exe.as_os_str());
+    let parameters = HSTRING::from(parameters.join(" "));
+    let verb = HSTRING::from("runas");
+
+    // SAFETY: wie oben; "runas" löst den UAC-Dialog aus. Werte über 32
+    // bedeuten Erfolg, kleinere sind Fehlercodes (z.B. abgelehnt).
+    let result = unsafe {
+        ShellExecuteW(
+            HWND::default(),
+            &verb,
+            &exe,
+            &parameters,
+            PCWSTR::null(),
+            SW_SHOWNORMAL,
+        )
+    };
+    result.0 as usize > 32
+}
+
+/// Setzt ein Argument mit Leerzeichen in Anführungszeichen
+#[cfg(target_os = "windows")]
+fn quote_argument(argument: String) -> String {
+    if argument.contains(' ') && !argument.starts_with('"') {
+        format!("\"{}\"", argument)
+    } else {
+        argument
+    }
+}
+
 /// Zeilenhöhe der Baumansicht, muss zu ui/main.slint passen
 const ROW_HEIGHT: f32 = 28.0;
 
@@ -106,16 +184,73 @@ impl SortOrder {
     }
 }
 
+/// Was gescannt wird: ein Laufwerk, und optional nur ein Ordner darauf.
+///
+/// Auch für einen Ordner wird die ganze MFT gelesen - das dauert Sekunden,
+/// ein rekursiver Verzeichnislauf Minuten. Gezeigt wird dann der Teilbaum.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ScanTarget {
+    /// Laufwerk, z.B. "C:"
+    drive: String,
+    /// Ordnernamen unterhalb der Wurzel, leer für das ganze Laufwerk
+    folder: Vec<String>,
+}
+
+impl ScanTarget {
+    fn drive(letter: &str) -> Self {
+        Self {
+            drive: letter.trim_end_matches('\\').to_uppercase(),
+            folder: Vec::new(),
+        }
+    }
+
+    /// Aus einem Pfad wie `C:\Users\kevin`; nur lokale Laufwerksbuchstaben
+    fn from_path(path: &Path) -> Result<Self, String> {
+        let mut drive = None;
+        let mut folder = Vec::new();
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => match prefix.kind() {
+                    Prefix::Disk(letter) | Prefix::VerbatimDisk(letter) => {
+                        drive = Some(format!("{}:", (letter as char).to_ascii_uppercase()));
+                    }
+                    _ => return Err(format!("Nur lokale Laufwerke werden unterstützt: {}", path.display())),
+                },
+                Component::RootDir | Component::CurDir => {}
+                Component::ParentDir => {
+                    return Err(format!("Pfad enthält '..': {}", path.display()));
+                }
+                Component::Normal(name) => folder.push(name.to_string_lossy().into_owned()),
+            }
+        }
+        let drive = drive.ok_or_else(|| format!("Kein Laufwerksbuchstabe in {}", path.display()))?;
+        Ok(Self { drive, folder })
+    }
+
+    /// "C:" oder "C:\Users\kevin"
+    fn display(&self) -> String {
+        let mut text = self.drive.clone();
+        for name in &self.folder {
+            text.push('\\');
+            text.push_str(name);
+        }
+        text
+    }
+}
+
 /// Globaler State für Thread-Sicherheit
 struct AppState {
     tree: Option<TreeNode>,
+    /// Was zuletzt gescannt wurde, für "Neu scannen"
+    target: Option<ScanTarget>,
     /// IDs (MFT-Referenzen) der aufgeklappten Ordner
     expanded: HashSet<u64>,
     sort: SortOrder,
-    /// Markierter Knoten (MFT-Referenz), per Klick in Liste oder Treemap
-    selected: Option<u64>,
+    /// Markierter Knoten als Weg von der Wurzel (IDs), per Klick in Liste
+    /// oder Treemap; der Weg erlaubt, ihn in der Treemap wiederzufinden
+    selected: Option<Vec<u64>>,
     /// Weg von der Wurzel zu dem Ordner, den die Treemap zeigt
-    /// (leer = das ganze Laufwerk)
+    /// (leer = der ganze gescannte Baum)
     treemap_root: Vec<u64>,
     /// Zuletzt gezeichnete Treemap, für Hover und Klick
     treemap: Option<Treemap>,
@@ -125,6 +260,7 @@ impl AppState {
     fn new() -> Self {
         Self {
             tree: None,
+            target: None,
             expanded: HashSet::new(),
             sort: SortOrder::default_for(SortColumn::Size),
             selected: None,
@@ -148,20 +284,56 @@ struct Gui {
     render_generation: Arc<AtomicU64>,
 }
 
+/// Ein lokales Laufwerk mit Belegung, für die Auswahl beim Start
+struct Drive {
+    letter: String,
+    label: String,
+    file_system: String,
+    total: u64,
+    free: u64,
+}
+
 /// Startet die grafische Benutzeroberfläche
-fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
+///
+/// Mit `initial_drive` beginnt der Scan sofort, sonst zeigt die
+/// Startansicht die Laufwerke zur Auswahl.
+fn run_gui(initial_drive: Option<String>) -> Result<(), Box<dyn std::error::Error>> {
     let main_window = MainWindow::new()?;
 
-    // Verfügbare Laufwerke ermitteln
-    let drives = get_available_drives();
-    let drive_model: Rc<slint::VecModel<SharedString>> =
-        Rc::new(slint::VecModel::from(
-            drives
-                .iter()
-                .map(|s| SharedString::from(s.as_str()))
-                .collect::<Vec<_>>(),
+    // Laufwerke für Startansicht und Auswahlliste
+    let drives = local_drives();
+    let letters: Vec<SharedString> = drives
+        .iter()
+        .map(|drive| SharedString::from(drive.letter.as_str()))
+        .collect();
+    main_window.set_available_drives(Rc::new(slint::VecModel::from(letters)).into());
+    let infos: Vec<DriveInfo> = drives
+        .iter()
+        .map(|drive| {
+            let used = if drive.total > 0 {
+                (drive.total.saturating_sub(drive.free)) as f32 / drive.total as f32
+            } else {
+                0.0
+            };
+            DriveInfo {
+                letter: SharedString::from(drive.letter.as_str()),
+                label: SharedString::from(drive.label.as_str()),
+                file_system: SharedString::from(drive.file_system.as_str()),
+                total: SharedString::from(format_size(drive.total)),
+                free: SharedString::from(format_size(drive.free)),
+                used,
+                used_text: SharedString::from(format!("{:.0} %", used * 100.0)),
+                scannable: drive.file_system.eq_ignore_ascii_case("NTFS"),
+            }
+        })
+        .collect();
+    main_window.set_drives(Rc::new(slint::VecModel::from(infos)).into());
+
+    if !is_elevated() {
+        main_window.set_status_text(SharedString::from(
+            "Ohne Administratorrechte - die MFT lässt sich nicht lesen",
         ));
-    main_window.set_available_drives(drive_model.into());
+    }
 
     let gui = Gui {
         window: main_window.as_weak(),
@@ -169,65 +341,38 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         render_generation: Arc::new(AtomicU64::new(0)),
     };
 
-    // Scan-Callback mit Background-Thread
+    // Laufwerk gewählt (Startansicht oder Auswahlliste): sofort scannen
     let gui_scan = gui.clone();
-    main_window.on_scan_drive(move |drive| {
-        let window = gui_scan.window.unwrap();
-        let drive_str = drive.to_string();
-        let window_weak_thread = window.as_weak();
-        let gui = gui_scan.clone();
+    main_window.on_scan_drive(move |letter| {
+        start_scan(&gui_scan, ScanTarget::drive(&letter));
+    });
 
-        window.set_is_scanning(true);
-        window.set_status_text(SharedString::from(format!("Initialisiere {}...", drive)));
-        window.set_scan_progress(0.0);
-
-        // MFT-Scan in Background-Thread durchführen
-        std::thread::spawn(move || {
-            let started = std::time::Instant::now();
-            let result = perform_scan_threaded(&drive_str, window_weak_thread.clone());
-            let elapsed = started.elapsed();
-
-            // Ergebnis zurück an UI-Thread senden
-            let _ = slint::invoke_from_event_loop(move || {
-                if let Some(window) = window_weak_thread.upgrade() {
-                    match result {
-                        Ok((root_node, timings)) => {
-                            let file_count = root_node.file_count;
-                            let dir_count = root_node.dir_count;
-
-                            // Neuer Baum, alles andere auf Anfang - bis auf
-                            // die gewählte Sortierung
-                            let mut state = gui.state.lock().unwrap();
-                            let sort = state.sort;
-                            *state = AppState::new();
-                            state.sort = sort;
-                            state.tree = Some(root_node);
-                            refresh_list(&window, &state);
-                            drop(state);
-
-                            window.set_treemap_root_text(SharedString::default());
-                            window.set_treemap_hover_text(SharedString::default());
-                            schedule_treemap_render(&gui);
-
-                            window.set_status_text(SharedString::from(format!(
-                                "Fertig in {} (Scan {}, Baum {}) - {} Dateien, {} Ordner",
-                                format_duration(elapsed),
-                                format_duration(timings.scan),
-                                format_duration(timings.tree),
-                                file_count,
-                                dir_count
-                            )));
-                        }
-                        Err(e) => {
-                            window.set_status_text(SharedString::from(format!("Fehler: {}", e)));
-                        }
-                    }
-
-                    window.set_is_scanning(false);
-                    window.set_scan_progress(1.0);
+    // Ordner wählen: nativer Dialog, dann Scan des Laufwerks, Anzeige des Teilbaums
+    let gui_folder = gui.clone();
+    main_window.on_pick_folder(move || {
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Ordner wählen")
+            .pick_folder()
+        else {
+            return;
+        };
+        match ScanTarget::from_path(&path) {
+            Ok(target) => start_scan(&gui_folder, target),
+            Err(message) => {
+                if let Some(window) = gui_folder.window.upgrade() {
+                    window.set_status_text(SharedString::from(message));
                 }
-            });
-        });
+            }
+        }
+    });
+
+    // Neu scannen: dasselbe Ziel noch einmal
+    let gui_rescan = gui.clone();
+    main_window.on_rescan(move || {
+        let target = gui_rescan.state.lock().unwrap().target.clone();
+        if let Some(target) = target {
+            start_scan(&gui_rescan, target);
+        }
     });
 
     // Klick auf eine Zeile: Ordner auf- oder zuklappen, Zeile markieren
@@ -250,19 +395,20 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
             return;
         };
 
-        // Finde die ID des geklickten Eintrags anhand des Index
-        let visible = collect_visible_ids(tree, expanded, *sort);
-        let Some(&clicked) = visible.get(index as usize) else {
+        // Finde den geklickten Eintrag anhand des Index
+        let Some(chain) = visible_chain_at(tree, expanded, *sort, index as usize) else {
             return;
         };
+        let clicked = *chain.last().expect("Kette enthält den Knoten selbst");
 
         // Toggle expanded state
         if !expanded.remove(&clicked) {
             expanded.insert(clicked);
         }
-        *selected = Some(clicked);
+        *selected = Some(chain);
 
         refresh_list(&window, &state);
+        update_highlight(&window, &state);
     });
 
     // Klick auf einen Spaltenkopf: Spalte wechseln oder Richtung umdrehen
@@ -311,13 +457,14 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         let Some(chain) = treemap_hit(&window, &state, x, y) else {
             return;
         };
-        let Some((&target, ancestors)) = chain.split_last() else {
+        let Some((_, ancestors)) = chain.split_last() else {
             return;
         };
         state.expanded.extend(ancestors.iter().copied());
-        state.selected = Some(target);
+        state.selected = Some(chain);
         refresh_list(&window, &state);
         scroll_to_selected(&window);
+        update_highlight(&window, &state);
     });
 
     // Doppelklick: in den Ordner unter der Maus absteigen
@@ -348,7 +495,7 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         schedule_treemap_render(&gui_descend);
     });
 
-    // "Hoch": eine Ebene zurück
+    // "Eine Ebene hoch": zurück aus dem Zoom
     let gui_ascend = gui.clone();
     main_window.on_treemap_ascend(move || {
         let window = gui_ascend.window.unwrap();
@@ -361,8 +508,90 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         schedule_treemap_render(&gui_ascend);
     });
 
+    if let Some(drive) = initial_drive {
+        start_scan(&gui, ScanTarget::drive(&drive));
+    }
+
     main_window.run()?;
     Ok(())
+}
+
+/// Startet den Scan im Hintergrund und trägt das Ergebnis in die GUI ein
+fn start_scan(gui: &Gui, target: ScanTarget) {
+    let Some(window) = gui.window.upgrade() else {
+        return;
+    };
+    if window.get_is_scanning() {
+        return;
+    }
+
+    // Auswahlliste auf das Laufwerk stellen (löst keinen Callback aus)
+    let drives = window.get_available_drives();
+    if let Some(index) = (0..drives.row_count())
+        .find(|&i| drives.row_data(i).is_some_and(|letter| letter.as_str() == target.drive))
+    {
+        window.set_selected_drive_index(index as i32);
+    }
+
+    window.set_is_scanning(true);
+    window.set_scan_target(SharedString::from(target.display()));
+    window.set_status_text(SharedString::from(format!("Initialisiere {}...", target.drive)));
+    window.set_scan_progress(0.0);
+    gui.state.lock().unwrap().target = Some(target.clone());
+
+    let gui = gui.clone();
+    let window_weak = window.as_weak();
+    std::thread::spawn(move || {
+        let started = std::time::Instant::now();
+        let result = perform_scan_threaded(&target, window_weak.clone());
+        let elapsed = started.elapsed();
+
+        // Ergebnis zurück an UI-Thread senden
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(window) = window_weak.upgrade() else {
+                return;
+            };
+            match result {
+                Ok((root_node, timings)) => {
+                    let file_count = root_node.file_count;
+                    let dir_count = root_node.dir_count;
+
+                    // Neuer Baum, alles andere auf Anfang - bis auf
+                    // Sortierung und Scan-Ziel
+                    let mut state = gui.state.lock().unwrap();
+                    let sort = state.sort;
+                    let target = state.target.take();
+                    *state = AppState::new();
+                    state.sort = sort;
+                    state.target = target;
+                    state.tree = Some(root_node);
+                    refresh_list(&window, &state);
+                    drop(state);
+
+                    window.set_has_tree(true);
+                    window.set_treemap_root_text(SharedString::default());
+                    window.set_treemap_hover_text(SharedString::default());
+                    window.set_highlight_visible(false);
+                    schedule_treemap_render(&gui);
+
+                    window.set_status_text(SharedString::from(format!(
+                        "Fertig in {} (Scan {}, Baum {}) - {} Dateien, {} Ordner",
+                        format_duration(elapsed),
+                        format_duration(timings.scan),
+                        format_duration(timings.tree),
+                        file_count,
+                        dir_count
+                    )));
+                }
+                Err(e) => {
+                    window.set_status_text(SharedString::from(format!("Fehler: {}", e)));
+                }
+            }
+
+            window.set_is_scanning(false);
+            window.set_scan_progress(1.0);
+        });
+    });
 }
 
 /// Dauer der beiden Scan-Phasen, getrennt gemessen
@@ -375,11 +604,11 @@ struct ScanTimings {
 
 /// Führt den MFT-Scan in einem Background-Thread durch
 fn perform_scan_threaded(
-    drive: &str,
+    target: &ScanTarget,
     window_weak: slint::Weak<MainWindow>,
 ) -> Result<(TreeNode, ScanTimings), String> {
     // MFT-Reader erstellen
-    let reader = MftReader::new(drive).map_err(|e| format!("{}", e))?;
+    let reader = MftReader::new(&target.drive).map_err(|e| format!("{}", e))?;
 
     // Scan durchführen mit Progress-Updates via invoke_from_event_loop
     let scan_started = std::time::Instant::now();
@@ -402,11 +631,15 @@ fn perform_scan_threaded(
         return Err("Keine Dateien gefunden. Admin-Rechte erforderlich!".to_string());
     }
 
-    // Baum aufbauen
+    // Baum aufbauen; für einen Ordner nur dessen Teilbaum behalten
     let tree_started = std::time::Instant::now();
     let builder = TreeBuilder::new(entries);
     let mut tree = builder.build();
-    tree.name = drive.to_string();
+    if !target.folder.is_empty() {
+        tree = extract_subtree(tree, &target.folder)
+            .ok_or_else(|| format!("Ordner nicht gefunden: {}", target.display()))?;
+    }
+    tree.name = target.display();
     let tree_time = tree_started.elapsed();
 
     Ok((
@@ -416,6 +649,20 @@ fn perform_scan_threaded(
             tree: tree_time,
         },
     ))
+}
+
+/// Löst den Ordner mit diesem Weg (Namen, ohne Groß/Klein) aus dem Baum
+/// heraus; der Rest des Baums wird dabei freigegeben
+fn extract_subtree(mut root: TreeNode, folder: &[String]) -> Option<TreeNode> {
+    for name in folder {
+        let wanted = name.to_lowercase();
+        let index = root
+            .children
+            .iter()
+            .position(|child| child.is_directory && child.name.to_lowercase() == wanted)?;
+        root = root.children.swap_remove(index);
+    }
+    Some(root)
 }
 
 /// Formatiert eine Dauer lesbar: "850 ms", "4,2 s", "1 min 12 s"
@@ -439,7 +686,9 @@ fn refresh_list(window: &MainWindow, state: &AppState) {
     let entries = tree_to_entries(tree, &state.expanded, state.sort);
     let selected_index = state
         .selected
-        .and_then(|id| {
+        .as_ref()
+        .and_then(|chain| chain.last())
+        .and_then(|&id| {
             collect_visible_ids(tree, &state.expanded, state.sort)
                 .iter()
                 .position(|&visible| visible == id)
@@ -466,7 +715,45 @@ fn scroll_to_selected(window: &MainWindow) {
     window.set_list_viewport_y(wanted.clamp(lowest, 0.0));
 }
 
-/// Zeigt den Pfad der Treemap-Wurzel im Kopf (leer für das Laufwerk)
+/// Zeichnet den Rahmen um den markierten Knoten in der Treemap - falls er
+/// in der gezeigten Treemap liegt und groß genug war, gezeichnet zu werden
+fn update_highlight(window: &MainWindow, state: &AppState) {
+    let bounds = state.selected.as_ref().and_then(|chain| {
+        // Nur Knoten unterhalb der Treemap-Wurzel haben dort ein Rechteck
+        let relative = chain.strip_prefix(state.treemap_root.as_slice())?;
+        if relative.is_empty() {
+            return None;
+        }
+        state.treemap.as_ref()?.bounds_of(relative)
+    });
+
+    let Some(Bounds { x0, y0, x1, y1 }) = bounds else {
+        window.set_highlight_visible(false);
+        return;
+    };
+
+    // Gerätepixel zurück in logische; winzige Kacheln bekommen einen
+    // Mindestrahmen um ihre Mitte, sonst wäre die Markierung unsichtbar
+    const MIN_SIZE: f32 = 8.0;
+    let scale = window.window().scale_factor();
+    let (mut x, mut y) = (x0 as f32 / scale, y0 as f32 / scale);
+    let (mut w, mut h) = ((x1 - x0) as f32 / scale, (y1 - y0) as f32 / scale);
+    if w < MIN_SIZE {
+        x -= (MIN_SIZE - w) / 2.0;
+        w = MIN_SIZE;
+    }
+    if h < MIN_SIZE {
+        y -= (MIN_SIZE - h) / 2.0;
+        h = MIN_SIZE;
+    }
+    window.set_highlight_x(x);
+    window.set_highlight_y(y);
+    window.set_highlight_width(w);
+    window.set_highlight_height(h);
+    window.set_highlight_visible(true);
+}
+
+/// Zeigt den Pfad der Treemap-Wurzel im Kopf (leer für den ganzen Baum)
 fn show_treemap_root(window: &MainWindow, state: &AppState) {
     let text = if state.treemap_root.is_empty() {
         String::new()
@@ -521,7 +808,9 @@ fn schedule_treemap_render(gui: &Gui) {
             let buffer =
                 SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(map.pixels(), map.width(), map.height());
             window.set_treemap_image(Image::from_rgb8(buffer));
-            gui.state.lock().unwrap().treemap = Some(map);
+            let mut state = gui.state.lock().unwrap();
+            state.treemap = Some(map);
+            update_highlight(&window, &state);
         });
     });
 }
@@ -597,33 +886,61 @@ fn ordered_children(node: &TreeNode, sort: SortOrder) -> Vec<&TreeNode> {
 }
 
 /// Läuft über die sichtbaren Knoten in Listenreihenfolge: die Kinder der
-/// Wurzel und darunter die aufgeklappten Ordner
+/// Wurzel und darunter die aufgeklappten Ordner. Der Besucher bekommt
+/// den Knoten, seine Tiefe, ob er aufgeklappt ist, und den Weg von der
+/// Wurzel bis einschließlich zu ihm.
 fn visit_visible<'a, F>(root: &'a TreeNode, expanded: &HashSet<u64>, sort: SortOrder, visit: &mut F)
 where
-    F: FnMut(&'a TreeNode, i32, bool),
+    F: FnMut(&'a TreeNode, i32, bool, &[u64]),
 {
-    fn walk<'a, F>(node: &'a TreeNode, expanded: &HashSet<u64>, sort: SortOrder, depth: i32, visit: &mut F)
-    where
-        F: FnMut(&'a TreeNode, i32, bool),
+    fn walk<'a, F>(
+        node: &'a TreeNode,
+        expanded: &HashSet<u64>,
+        sort: SortOrder,
+        chain: &mut Vec<u64>,
+        visit: &mut F,
+    ) where
+        F: FnMut(&'a TreeNode, i32, bool, &[u64]),
     {
         let is_expanded = node.is_directory && expanded.contains(&node.id);
-        visit(node, depth, is_expanded);
+        chain.push(node.id);
+        visit(node, chain.len() as i32 - 1, is_expanded, chain);
         if is_expanded {
             for child in ordered_children(node, sort) {
-                walk(child, expanded, sort, depth + 1, visit);
+                walk(child, expanded, sort, chain, visit);
             }
         }
+        chain.pop();
     }
 
+    let mut chain = Vec::new();
     for child in ordered_children(root, sort) {
-        walk(child, expanded, sort, 0, visit);
+        walk(child, expanded, sort, &mut chain, visit);
     }
+}
+
+/// Der Weg zum sichtbaren Knoten an Listenposition `index`
+fn visible_chain_at(
+    root: &TreeNode,
+    expanded: &HashSet<u64>,
+    sort: SortOrder,
+    index: usize,
+) -> Option<Vec<u64>> {
+    let mut found = None;
+    let mut position = 0;
+    visit_visible(root, expanded, sort, &mut |_, _, _, chain| {
+        if position == index {
+            found = Some(chain.to_vec());
+        }
+        position += 1;
+    });
+    found
 }
 
 /// Konvertiert den Baum in flache TreeEntry-Liste für die GUI
 fn tree_to_entries(root: &TreeNode, expanded: &HashSet<u64>, sort: SortOrder) -> Vec<TreeEntry> {
     let mut entries = Vec::new();
-    visit_visible(root, expanded, sort, &mut |node, depth, is_expanded| {
+    visit_visible(root, expanded, sort, &mut |node, depth, is_expanded, _| {
         entries.push(TreeEntry {
             name: SharedString::from(&node.name),
             size: SharedString::from(format_size(node.total_size)),
@@ -641,7 +958,7 @@ fn tree_to_entries(root: &TreeNode, expanded: &HashSet<u64>, sort: SortOrder) ->
 /// tree_to_entries, um einen Listen-Index einem Knoten zuzuordnen
 fn collect_visible_ids(root: &TreeNode, expanded: &HashSet<u64>, sort: SortOrder) -> Vec<u64> {
     let mut ids = Vec::new();
-    visit_visible(root, expanded, sort, &mut |node, _, _| ids.push(node.id));
+    visit_visible(root, expanded, sort, &mut |node, _, _, _| ids.push(node.id));
     ids
 }
 
@@ -748,27 +1065,89 @@ fn run_cli(
     Ok(())
 }
 
-/// Ermittelt die verfügbaren Laufwerke auf Windows
-fn get_available_drives() -> Vec<String> {
+/// Ermittelt die lokalen Laufwerke mit Bezeichnung, Dateisystem und Belegung
+///
+/// Nur feste und Wechsel-Laufwerke; Netzlaufwerke und CD-Laufwerke haben
+/// keine MFT, die wir lesen könnten. Laufwerke ohne Medium (leerer
+/// Kartenleser) fallen weg, weil ihre Volume-Informationen fehlschlagen.
+#[cfg(target_os = "windows")]
+fn local_drives() -> Vec<Drive> {
+    use windows::core::HSTRING;
+    use windows::Win32::Storage::FileSystem::{
+        GetDiskFreeSpaceExW, GetDriveTypeW, GetLogicalDrives, GetVolumeInformationW,
+    };
+
+    // Rückgabewerte von GetDriveTypeW (winbase.h)
+    const DRIVE_REMOVABLE: u32 = 2;
+    const DRIVE_FIXED: u32 = 3;
+
     let mut drives = Vec::new();
-
-    #[cfg(target_os = "windows")]
-    {
-        use windows::Win32::Storage::FileSystem::GetLogicalDrives;
-
-        let mask = unsafe { GetLogicalDrives() };
-        for i in 0..26 {
-            if mask & (1 << i) != 0 {
-                let letter = (b'A' + i) as char;
-                drives.push(format!("{}:", letter));
-            }
+    // SAFETY: reine Win32-Aufrufe mit gültigen, ausreichend großen Puffern
+    let mask = unsafe { GetLogicalDrives() };
+    for i in 0..26 {
+        if mask & (1 << i) == 0 {
+            continue;
         }
-    }
+        let letter = (b'A' + i) as char;
+        let root = HSTRING::from(format!("{}:\\", letter));
 
-    #[cfg(not(target_os = "windows"))]
-    {
-        drives.push("C:".to_string());
+        let kind = unsafe { GetDriveTypeW(&root) };
+        if kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE {
+            continue;
+        }
+
+        let mut label = [0u16; 64];
+        let mut file_system = [0u16; 32];
+        let volume = unsafe {
+            GetVolumeInformationW(
+                &root,
+                Some(label.as_mut_slice()),
+                None,
+                None,
+                None,
+                Some(file_system.as_mut_slice()),
+            )
+        };
+        if volume.is_err() {
+            continue;
+        }
+
+        let (mut available, mut total, mut free) = (0u64, 0u64, 0u64);
+        let _ = unsafe {
+            GetDiskFreeSpaceExW(
+                &root,
+                Some(&mut available as *mut u64),
+                Some(&mut total as *mut u64),
+                Some(&mut free as *mut u64),
+            )
+        };
+
+        drives.push(Drive {
+            letter: format!("{}:", letter),
+            label: wide_to_string(&label),
+            file_system: wide_to_string(&file_system),
+            total,
+            free,
+        });
     }
 
     drives
+}
+
+#[cfg(not(target_os = "windows"))]
+fn local_drives() -> Vec<Drive> {
+    vec![Drive {
+        letter: "C:".to_string(),
+        label: String::new(),
+        file_system: "NTFS".to_string(),
+        total: 0,
+        free: 0,
+    }]
+}
+
+/// UTF-16-Puffer bis zum ersten Nullzeichen als String
+#[cfg(target_os = "windows")]
+fn wide_to_string(buffer: &[u16]) -> String {
+    let end = buffer.iter().position(|&c| c == 0).unwrap_or(buffer.len());
+    String::from_utf16_lossy(&buffer[..end])
 }

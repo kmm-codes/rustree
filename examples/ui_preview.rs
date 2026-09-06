@@ -154,8 +154,41 @@ fn main() -> Result<(), slint::PlatformError> {
     let treemap: Rc<RefCell<Option<Treemap>>> = Rc::new(RefCell::new(None));
 
     window.set_tree_entries(Rc::new(VecModel::from(entries_for(&tree))).into());
-    window.set_selected_index(2);
+    window.set_selected_index(1);
     window.set_status_text(SharedString::from("Vorschau - Beispieldaten"));
+    window.set_scan_target(SharedString::from("C:"));
+
+    // Laufwerke für die Startansicht; RUSTREE_PREVIEW_START=1 zeigt sie
+    // statt des Scan-Ergebnisses
+    let drive = |letter: &str, label: &str, fs: &str, total: &str, free: &str, used: f32| DriveInfo {
+        letter: SharedString::from(letter),
+        label: SharedString::from(label),
+        file_system: SharedString::from(fs),
+        total: SharedString::from(total),
+        free: SharedString::from(free),
+        used,
+        used_text: SharedString::from(format!("{:.0} %", used * 100.0)),
+        scannable: fs == "NTFS",
+    };
+    window.set_drives(
+        Rc::new(VecModel::from(vec![
+            drive("C:", "M2_1", "NTFS", "3.72 TB", "2.41 TB", 0.35),
+            drive("D:", "SSD2", "NTFS", "3.64 TB", "595.70 GB", 0.84),
+            drive("E:", "SSD3", "exFAT", "931.51 GB", "130.80 GB", 0.86),
+            drive("F:", "M2_2", "NTFS", "1.82 TB", "151.54 GB", 0.92),
+        ]))
+        .into(),
+    );
+    window.set_available_drives(
+        Rc::new(VecModel::from(vec![
+            SharedString::from("C:"),
+            SharedString::from("D:"),
+            SharedString::from("E:"),
+            SharedString::from("F:"),
+        ]))
+        .into(),
+    );
+    window.set_has_tree(std::env::var_os("RUSTREE_PREVIEW_START").is_none());
 
     // Treemap in der Größe des Bereichs zeichnen, auch nach Größenänderung
     let window_weak = window.as_weak();
@@ -172,6 +205,17 @@ fn main() -> Result<(), slint::PlatformError> {
         let map = Treemap::render(&tree_render, width, height);
         let buffer = SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(map.pixels(), width, height);
         window.set_treemap_image(Image::from_rgb8(buffer));
+
+        // Markierung wie nach einem Klick: die zweite Zeile der Liste ist
+        // die VHDX-Datei im ersten Ordner
+        let first = &tree_render.children[0];
+        if let Some(bounds) = map.bounds_of(&[first.id, first.children[0].id]) {
+            window.set_highlight_x(bounds.x0 as f32 / scale);
+            window.set_highlight_y(bounds.y0 as f32 / scale);
+            window.set_highlight_width((bounds.x1 - bounds.x0) as f32 / scale);
+            window.set_highlight_height((bounds.y1 - bounds.y0) as f32 / scale);
+            window.set_highlight_visible(true);
+        }
         *treemap_render.borrow_mut() = Some(map);
     };
     window.on_treemap_resized(render);

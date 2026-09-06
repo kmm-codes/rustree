@@ -1,5 +1,5 @@
 // rustree - NTFS Disk Space Analyzer
-// Hauptfenster mit Baumansicht und Treemap
+// Hauptfenster mit Laufwerksauswahl, Baumansicht und Treemap
 
 import { Button, VerticalBox, HorizontalBox, ListView, ComboBox, ProgressIndicator } from "std-widgets.slint";
 
@@ -15,6 +15,20 @@ export struct TreeEntry {
     has_children: bool,
 }
 
+// Ein lokales Laufwerk für die Auswahl beim Start
+export struct DriveInfo {
+    letter: string,
+    label: string,
+    file_system: string,
+    total: string,
+    free: string,
+    // Belegter Anteil 0..1 für den Balken, und als Text
+    used: float,
+    used_text: string,
+    // Nur NTFS lässt sich über die MFT scannen
+    scannable: bool,
+}
+
 // Spalten der Baumansicht, nach denen sortiert werden kann
 export enum SortColumn { name, size }
 
@@ -27,10 +41,15 @@ export component MainWindow inherits Window {
 
     // Properties die von Rust gesetzt werden
     in-out property <[string]> available_drives: ["C:", "D:", "E:"];
+    in-out property <[DriveInfo]> drives: [];
     in-out property <int> selected_drive_index: 0;
     in-out property <[TreeEntry]> tree_entries: [];
     in-out property <float> scan_progress: 0.0;
     in-out property <bool> is_scanning: false;
+    // Liegt ein Scan-Ergebnis vor? Vorher zeigt die Startansicht die Laufwerke
+    in-out property <bool> has_tree: false;
+    // Was gescannt wurde bzw. wird: "C:" oder "C:\Users\kevin"
+    in-out property <string> scan_target: "";
     in-out property <string> status_text: "Bereit";
 
     // Sortierung der Baumansicht; Rust hält den Zustand, die GUI zeigt ihn
@@ -50,9 +69,17 @@ export component MainWindow inherits Window {
     // Größe des Zeichenbereichs, damit Rust das Bild passend rendert
     out property <length> treemap_width: treemap_area.width;
     out property <length> treemap_height: treemap_area.height;
+    // Rahmen um den markierten Knoten, in logischen Pixeln relativ zum Bild
+    in-out property <bool> highlight_visible: false;
+    in-out property <length> highlight_x: 0px;
+    in-out property <length> highlight_y: 0px;
+    in-out property <length> highlight_width: 0px;
+    in-out property <length> highlight_height: 0px;
 
     // Callbacks nach Rust
     callback scan_drive(string);
+    callback pick_folder();
+    callback rescan();
     callback toggle_entry(int);
     callback sort_by(SortColumn);
     callback treemap_resized();
@@ -65,7 +92,7 @@ export component MainWindow inherits Window {
         padding: 16px;
         spacing: 12px;
 
-        // Header mit Drive-Auswahl
+        // Kopfzeile: Laufwerk wechseln (scannt sofort), Ordner, neu scannen
         HorizontalBox {
             spacing: 12px;
             height: 40px;
@@ -79,15 +106,35 @@ export component MainWindow inherits Window {
             ComboBox {
                 model: available_drives;
                 current-index <=> selected_drive_index;
+                enabled: !is_scanning;
                 width: 100px;
+                selected(letter) => {
+                    scan_drive(letter);
+                }
             }
 
             Button {
-                text: is_scanning ? "Scanne..." : "Scannen";
+                text: "Ordner...";
                 enabled: !is_scanning;
                 clicked => {
-                    scan_drive(available_drives[selected_drive_index]);
+                    pick_folder();
                 }
+            }
+
+            Button {
+                text: is_scanning ? "Scanne..." : "Neu scannen";
+                enabled: has_tree && !is_scanning;
+                clicked => {
+                    rescan();
+                }
+            }
+
+            Text {
+                text: scan_target;
+                color: #cdd6f4;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
             }
 
             Rectangle {
@@ -107,226 +154,381 @@ export component MainWindow inherits Window {
             height: 8px;
         }
 
-        // Hauptbereich: Baumansicht links, Treemap rechts
-        HorizontalBox {
-            spacing: 12px;
+        // Hauptbereich: Baumansicht links, Treemap rechts. Die Startansicht
+        // liegt darüber, bis ein Scan läuft - die Elemente darunter müssen
+        // immer existieren, weil Properties der Wurzel auf sie zeigen.
+        Rectangle {
             vertical-stretch: 1;
 
-            // Baumansicht
-            Rectangle {
-                background: #313244;
-                border-radius: 8px;
-                width: 45%;
+            HorizontalBox {
+                padding: 0;
+                spacing: 12px;
 
-                VerticalBox {
-                    padding: 8px;
-                    spacing: 4px;
+                // Baumansicht
+                Rectangle {
+                    background: #313244;
+                    border-radius: 8px;
+                    width: 45%;
 
-                    // Spaltenköpfe: Klick sortiert, zweiter Klick dreht um.
-                    // Gleiche Geometrie wie die Zeilen darunter.
-                    Rectangle {
-                        height: 28px;
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 4px;
 
-                        name_header := TouchArea {
-                            x: 0;
-                            width: parent.width - 96px;
-                            height: parent.height;
-                            clicked => { root.sort_by(SortColumn.name); }
+                        // Spaltenköpfe: Klick sortiert, zweiter Klick dreht um.
+                        // Gleiche Geometrie wie die Zeilen darunter.
+                        Rectangle {
+                            height: 28px;
 
-                            Rectangle {
-                                background: parent.has-hover ? #45475a : transparent;
-                                border-radius: 4px;
+                            name_header := TouchArea {
+                                x: 0;
+                                width: parent.width - 96px;
+                                height: parent.height;
+                                clicked => { root.sort_by(SortColumn.name); }
 
-                                Text {
-                                    x: 8px;
-                                    width: parent.width - 16px;
-                                    height: parent.height;
-                                    text: root.sort_column == SortColumn.name
-                                        ? (root.sort_descending ? "Name ▼" : "Name ▲")
-                                        : "Name";
-                                    color: #cdd6f4;
-                                    font-size: 14px;
-                                    font-weight: 600;
-                                    vertical-alignment: center;
-                                    overflow: elide;
+                                Rectangle {
+                                    background: parent.has-hover ? #45475a : transparent;
+                                    border-radius: 4px;
+
+                                    Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: parent.height;
+                                        text: root.sort_column == SortColumn.name
+                                            ? (root.sort_descending ? "Name ▼" : "Name ▲")
+                                            : "Name";
+                                        color: #cdd6f4;
+                                        font-size: 14px;
+                                        font-weight: 600;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+
+                            size_header := TouchArea {
+                                x: parent.width - 96px;
+                                width: 96px;
+                                height: parent.height;
+                                clicked => { root.sort_by(SortColumn.size); }
+
+                                Rectangle {
+                                    background: parent.has-hover ? #45475a : transparent;
+                                    border-radius: 4px;
+
+                                    Text {
+                                        x: 8px;
+                                        width: parent.width - 16px;
+                                        height: parent.height;
+                                        text: root.sort_column == SortColumn.size
+                                            ? (root.sort_descending ? "Größe ▼" : "Größe ▲")
+                                            : "Größe";
+                                        color: #cdd6f4;
+                                        font-size: 14px;
+                                        font-weight: 600;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
                                 }
                             }
                         }
 
-                        size_header := TouchArea {
-                            x: parent.width - 96px;
-                            width: 96px;
-                            height: parent.height;
-                            clicked => { root.sort_by(SortColumn.size); }
+                        list := ListView {
+                            // Feste Positionierung statt HorizontalBox: die Zeile
+                            // bleibt genau so breit wie die Liste (ein Layout würde
+                            // sich an langen Namen orientieren und die Liste
+                            // horizontal scrollbar machen), und der Name bekommt
+                            // eine echte Breite und Höhe, damit overflow: elide
+                            // greift statt die Zeile ganz zu verwerfen.
+                            for entry[index] in tree_entries: Rectangle {
+                                height: 28px;
+                                background: index == root.selected_index ? #585b70
+                                    : touch.has-hover ? #45475a : transparent;
 
-                            Rectangle {
-                                background: parent.has-hover ? #45475a : transparent;
-                                border-radius: 4px;
+                                property <length> indent: entry.depth * 20px + 8px;
 
+                                touch := TouchArea {
+                                    clicked => {
+                                        toggle_entry(index);
+                                    }
+                                }
+
+                                // Auf-/Zuklappen: ein Dreieck, für zugeklappte
+                                // Ordner gedreht. Ein eigenes Zeichen für
+                                // "rechts" (▶) rendert Windows als Emoji.
                                 Text {
-                                    x: 8px;
-                                    width: parent.width - 16px;
+                                    x: indent;
+                                    width: 16px;
                                     height: parent.height;
-                                    text: root.sort_column == SortColumn.size
-                                        ? (root.sort_descending ? "Größe ▼" : "Größe ▲")
-                                        : "Größe";
-                                    color: #cdd6f4;
-                                    font-size: 14px;
-                                    font-weight: 600;
+                                    text: entry.has_children ? "▼" : "";
+                                    transform-rotation: entry.expanded ? 0deg : -90deg;
+                                    color: #89b4fa;
+                                    horizontal-alignment: center;
+                                    vertical-alignment: center;
+                                }
+
+                                // Ordner/Datei Icon
+                                Text {
+                                    x: indent + 24px;
+                                    width: 20px;
+                                    height: parent.height;
+                                    text: entry.is_directory ? "📁" : "📄";
+                                    vertical-alignment: center;
+                                }
+
+                                // Name
+                                Text {
+                                    x: indent + 52px;
+                                    width: max(0px, parent.width - self.x - 96px);
+                                    height: parent.height;
+                                    text: entry.name;
+                                    color: entry.is_directory ? #89dceb : #cdd6f4;
+                                    overflow: elide;
+                                    vertical-alignment: center;
+                                }
+
+                                // Größe
+                                Text {
+                                    x: parent.width - 88px;
+                                    width: 80px;
+                                    height: parent.height;
+                                    text: entry.size;
+                                    color: #f9e2af;
                                     horizontal-alignment: right;
                                     vertical-alignment: center;
                                 }
                             }
                         }
                     }
+                }
 
-                    list := ListView {
-                        // Feste Positionierung statt HorizontalBox: die Zeile
-                        // bleibt genau so breit wie die Liste (ein Layout würde
-                        // sich an langen Namen orientieren und die Liste
-                        // horizontal scrollbar machen), und der Name bekommt
-                        // eine echte Breite und Höhe, damit overflow: elide
-                        // greift statt die Zeile ganz zu verwerfen.
-                        for entry[index] in tree_entries: Rectangle {
+                // Treemap Bereich
+                Rectangle {
+                    background: #313244;
+                    border-radius: 8px;
+                    horizontal-stretch: 1;
+
+                    VerticalBox {
+                        padding: 8px;
+                        spacing: 4px;
+
+                        // Kopf: Titel, Pfad der gezeigten Wurzel, Hoch-Knopf
+                        HorizontalBox {
+                            padding: 0;
+                            spacing: 8px;
                             height: 28px;
-                            background: index == root.selected_index ? #585b70
-                                : touch.has-hover ? #45475a : transparent;
 
-                            property <length> indent: entry.depth * 20px + 8px;
+                            Text {
+                                text: "Treemap";
+                                color: #cdd6f4;
+                                font-size: 14px;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
 
-                            touch := TouchArea {
-                                clicked => {
-                                    toggle_entry(index);
+                            Text {
+                                text: treemap_root_text;
+                                color: #a6adc8;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+
+                            // Nur aktiv, wenn per Doppelklick in einen Ordner
+                            // gezoomt wurde - sonst gibt es nichts darüber
+                            Button {
+                                text: "Eine Ebene hoch";
+                                enabled: treemap_root_text != "";
+                                clicked => { root.treemap_ascend(); }
+                            }
+                        }
+
+                        // Zeichenbereich: das Bild kommt aus Rust, in genau
+                        // dieser Größe; Größenänderungen lösen ein neues aus
+                        treemap_area := Rectangle {
+                            background: #1e1e2e;
+                            border-radius: 4px;
+                            vertical-stretch: 1;
+                            clip: true;
+
+                            changed width => { root.treemap_resized(); }
+                            changed height => { root.treemap_resized(); }
+
+                            Image {
+                                width: parent.width;
+                                height: parent.height;
+                                source: treemap_image;
+                                image-fit: fill;
+                            }
+
+                            // Markierung: heller Rahmen mit leichter Aufhellung,
+                            // damit auch kleine Kacheln zu finden sind
+                            if highlight_visible: Rectangle {
+                                x: highlight_x;
+                                y: highlight_y;
+                                width: highlight_width;
+                                height: highlight_height;
+                                background: #ffffff33;
+                                border-width: 2px;
+                                border-color: #f9e2af;
+                            }
+
+                            map_touch := TouchArea {
+                                moved => { root.treemap_hover(self.mouse-x / 1px, self.mouse-y / 1px); }
+                                clicked => { root.treemap_clicked(self.mouse-x / 1px, self.mouse-y / 1px); }
+                                double-clicked => { root.treemap_descend(self.mouse-x / 1px, self.mouse-y / 1px); }
+                                changed has-hover => {
+                                    if (!self.has-hover) { root.treemap_hover(-1, -1); }
                                 }
                             }
+                        }
 
-                            // Expand/Collapse Icon
-                            Text {
-                                x: indent;
-                                width: 16px;
-                                height: parent.height;
-                                text: entry.has_children ? (entry.expanded ? "▼" : "▶") : "";
-                                color: #89b4fa;
-                                horizontal-alignment: center;
-                                vertical-alignment: center;
-                            }
-
-                            // Ordner/Datei Icon
-                            Text {
-                                x: indent + 24px;
-                                width: 20px;
-                                height: parent.height;
-                                text: entry.is_directory ? "📁" : "📄";
-                                vertical-alignment: center;
-                            }
-
-                            // Name
-                            Text {
-                                x: indent + 52px;
-                                width: max(0px, parent.width - self.x - 96px);
-                                height: parent.height;
-                                text: entry.name;
-                                color: entry.is_directory ? #89dceb : #cdd6f4;
-                                overflow: elide;
-                                vertical-alignment: center;
-                            }
-
-                            // Größe
-                            Text {
-                                x: parent.width - 88px;
-                                width: 80px;
-                                height: parent.height;
-                                text: entry.size;
-                                color: #f9e2af;
-                                horizontal-alignment: right;
-                                vertical-alignment: center;
-                            }
+                        // Was unter der Maus liegt; sonst ein Hinweis zur Bedienung
+                        Text {
+                            height: 20px;
+                            text: treemap_hover_text != "" ? treemap_hover_text
+                                : (has_tree ? "Klick markiert im Baum, Doppelklick zoomt in den Ordner" : "");
+                            color: #a6adc8;
+                            vertical-alignment: center;
+                            overflow: elide;
                         }
                     }
                 }
             }
 
-            // Treemap Bereich
-            Rectangle {
-                background: #313244;
-                border-radius: 8px;
-                horizontal-stretch: 1;
+            // Startansicht: Laufwerke mit Belegung, ein Klick startet den Scan
+            if !has_tree && !is_scanning: Rectangle {
+                background: #1e1e2e;
 
-                VerticalBox {
-                    padding: 8px;
-                    spacing: 4px;
+                VerticalLayout {
+                    alignment: center;
 
-                    // Kopf: Titel, Pfad der gezeigten Wurzel, Hoch-Knopf
-                    HorizontalBox {
-                        padding: 0;
-                        spacing: 8px;
-                        height: 28px;
+                    HorizontalLayout {
+                        alignment: center;
 
-                        Text {
-                            text: "Treemap";
-                            color: #cdd6f4;
-                            font-size: 14px;
-                            font-weight: 600;
-                            vertical-alignment: center;
-                        }
+                        Rectangle {
+                            width: 760px;
+                            background: #313244;
+                            border-radius: 8px;
 
-                        Text {
-                            text: treemap_root_text;
-                            color: #a6adc8;
-                            vertical-alignment: center;
-                            overflow: elide;
-                            horizontal-stretch: 1;
-                        }
+                            VerticalBox {
+                                padding: 16px;
+                                spacing: 6px;
 
-                        Button {
-                            text: "Hoch";
-                            enabled: treemap_root_text != "";
-                            clicked => { root.treemap_ascend(); }
-                        }
-                    }
+                                Text {
+                                    text: "Laufwerk wählen";
+                                    color: #cdd6f4;
+                                    font-size: 18px;
+                                    font-weight: 600;
+                                }
 
-                    // Zeichenbereich: das Bild kommt aus Rust, in genau
-                    // dieser Größe; Größenänderungen lösen ein neues aus
-                    treemap_area := Rectangle {
-                        background: #1e1e2e;
-                        border-radius: 4px;
-                        vertical-stretch: 1;
-                        clip: true;
+                                Text {
+                                    text: "Ein Klick scannt das Laufwerk. Nur NTFS-Laufwerke lassen sich über die MFT lesen.";
+                                    color: #a6adc8;
+                                }
 
-                        changed width => { root.treemap_resized(); }
-                        changed height => { root.treemap_resized(); }
+                                // Spaltenköpfe, gleiche Geometrie wie die Zeilen
+                                Rectangle {
+                                    height: 24px;
 
-                        Image {
-                            width: parent.width;
-                            height: parent.height;
-                            source: treemap_image;
-                            image-fit: fill;
-                        }
+                                    Text { x: 12px; width: 240px; height: parent.height; text: "Name"; color: #a6adc8; font-weight: 600; vertical-alignment: center; }
+                                    Text { x: 260px; width: 70px; height: parent.height; text: "System"; color: #a6adc8; font-weight: 600; vertical-alignment: center; }
+                                    Text { x: 330px; width: 110px; height: parent.height; text: "Gesamt"; color: #a6adc8; font-weight: 600; horizontal-alignment: right; vertical-alignment: center; }
+                                    Text { x: 450px; width: 110px; height: parent.height; text: "Frei"; color: #a6adc8; font-weight: 600; horizontal-alignment: right; vertical-alignment: center; }
+                                    Text { x: 580px; width: 148px; height: parent.height; text: "Belegt"; color: #a6adc8; font-weight: 600; vertical-alignment: center; }
+                                }
 
-                        if tree_entries.length == 0: Text {
-                            text: "Starte einen Scan...";
-                            color: #6c7086;
-                            horizontal-alignment: center;
-                            vertical-alignment: center;
-                        }
+                                for drive in drives: Rectangle {
+                                    height: 36px;
+                                    border-radius: 4px;
+                                    background: drive.scannable && row_touch.has-hover ? #45475a : transparent;
 
-                        map_touch := TouchArea {
-                            moved => { root.treemap_hover(self.mouse-x / 1px, self.mouse-y / 1px); }
-                            clicked => { root.treemap_clicked(self.mouse-x / 1px, self.mouse-y / 1px); }
-                            double-clicked => { root.treemap_descend(self.mouse-x / 1px, self.mouse-y / 1px); }
-                            changed has-hover => {
-                                if (!self.has-hover) { root.treemap_hover(-1, -1); }
+                                    row_touch := TouchArea {
+                                        enabled: drive.scannable;
+                                        clicked => { root.scan_drive(drive.letter); }
+                                    }
+
+                                    Text {
+                                        x: 12px;
+                                        width: 240px;
+                                        height: parent.height;
+                                        text: drive.label == "" ? drive.letter : drive.label + " (" + drive.letter + ")";
+                                        color: drive.scannable ? #cdd6f4 : #6c7086;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        x: 260px;
+                                        width: 70px;
+                                        height: parent.height;
+                                        text: drive.file_system;
+                                        color: drive.scannable ? #a6adc8 : #6c7086;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        x: 330px;
+                                        width: 110px;
+                                        height: parent.height;
+                                        text: drive.total;
+                                        color: drive.scannable ? #cdd6f4 : #6c7086;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    Text {
+                                        x: 450px;
+                                        width: 110px;
+                                        height: parent.height;
+                                        text: drive.free;
+                                        color: drive.scannable ? #a6adc8 : #6c7086;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                    // Belegungsbalken
+                                    Rectangle {
+                                        x: 580px;
+                                        y: (parent.height - 12px) / 2;
+                                        width: 90px;
+                                        height: 12px;
+                                        background: #45475a;
+                                        border-radius: 2px;
+
+                                        Rectangle {
+                                            x: 0;
+                                            width: parent.width * drive.used;
+                                            height: parent.height;
+                                            background: drive.scannable ? #89b4fa : #6c7086;
+                                            border-radius: 2px;
+                                        }
+                                    }
+                                    Text {
+                                        x: 676px;
+                                        width: 52px;
+                                        height: parent.height;
+                                        text: drive.used_text;
+                                        color: drive.scannable ? #f9e2af : #6c7086;
+                                        horizontal-alignment: right;
+                                        vertical-alignment: center;
+                                    }
+                                }
+
+                                HorizontalBox {
+                                    padding: 0;
+                                    padding-top: 8px;
+
+                                    Text {
+                                        text: "Oder nur einen Ordner ansehen - das Laufwerk wird trotzdem komplett gelesen, das ist der schnelle Weg:";
+                                        color: #a6adc8;
+                                        vertical-alignment: center;
+                                        overflow: elide;
+                                        horizontal-stretch: 1;
+                                    }
+
+                                    Button {
+                                        text: "Ordner wählen...";
+                                        clicked => { root.pick_folder(); }
+                                    }
+                                }
                             }
                         }
-                    }
-
-                    // Was unter der Maus liegt
-                    Text {
-                        height: 20px;
-                        text: treemap_hover_text;
-                        color: #a6adc8;
-                        vertical-alignment: center;
-                        overflow: elide;
                     }
                 }
             }

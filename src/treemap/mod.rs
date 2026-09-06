@@ -67,6 +67,15 @@ pub struct Hit<'a> {
     pub chain: &'a [u64],
 }
 
+/// Pixelgrenzen eines gezeichneten Rechtecks, Ende exklusiv
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Bounds {
+    pub x0: u32,
+    pub y0: u32,
+    pub x1: u32,
+    pub y1: u32,
+}
+
 /// Eine fertig gezeichnete Treemap: Pixel plus Trefferliste
 pub struct Treemap {
     width: u32,
@@ -134,6 +143,23 @@ impl Treemap {
             .map(|rect| Hit {
                 chain: &self.chains
                     [rect.chain_start as usize..rect.chain_start as usize + rect.chain_len as usize],
+            })
+    }
+
+    /// Das Rechteck des Knotens mit genau dieser Kette, falls gezeichnet
+    /// (die Kette ist relativ zur Treemap-Wurzel, wie bei [`Treemap::hit`])
+    pub fn bounds_of(&self, chain: &[u64]) -> Option<Bounds> {
+        self.rects
+            .iter()
+            .find(|rect| {
+                let start = rect.chain_start as usize;
+                &self.chains[start..start + rect.chain_len as usize] == chain
+            })
+            .map(|rect| Bounds {
+                x0: rect.x0,
+                y0: rect.y0,
+                x1: rect.x1,
+                y1: rect.y1,
             })
     }
 
@@ -404,6 +430,12 @@ mod tests {
         assert_eq!(hit.chain, &[20]);
         assert!(map.hit(-1.0, 0.0).is_none());
         assert!(map.hit(1000.0, 0.0).is_none());
+
+        // Rechteck zur Kette: die kleine Datei sitzt rechts, volle Höhe
+        let bounds = map.bounds_of(&[20]).unwrap();
+        assert_eq!((bounds.x0, bounds.y0, bounds.x1, bounds.y1), (90, 0, 100, 50));
+        assert!(map.bounds_of(&[99]).is_none());
+        assert_eq!(map.bounds_of(&[]).map(|b| b.x1), Some(100));
 
         // Gezeichnet, nicht schwarz
         let pixel = &map.pixels()[(25 * 100 + 10) * 3..(25 * 100 + 10) * 3 + 3];

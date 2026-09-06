@@ -61,9 +61,15 @@ Mit spezifischem Laufwerk:
 
 ### Bedienung
 
-1. **Laufwerk wählen**: Dropdown-Menü oben links
-2. **Scannen**: Klick auf "Scannen" startet den MFT-Scan
-3. **Ordner aufklappen**: Klick auf ▶ um Unterordner zu sehen
+1. **Administratorrechte**: Beim Start fragt rustree, ob es sich mit
+   Administratorrechten neu starten soll - ohne sie lässt sich die MFT
+   nicht lesen
+2. **Laufwerk wählen**: Die Startansicht listet die lokalen Laufwerke mit
+   Größe, freiem Platz und Belegung; ein Klick startet den Scan. "Ordner
+   wählen..." scannt das Laufwerk ebenfalls komplett und zeigt nur den
+   Ordner. Ein Wechsel in der Kopfzeile scannt sofort, "Neu scannen"
+   wiederholt den letzten Scan
+3. **Ordner aufklappen**: Klick auf das Dreieck um Unterordner zu sehen
 4. **Sortieren**: Klick auf "Name" oder "Größe" im Spaltenkopf, ein
    zweiter Klick dreht die Richtung um
 5. **Treemap**: Jede Kachel ist eine Datei, ihre Fläche die Größe, ihre

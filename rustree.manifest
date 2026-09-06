@@ -8,11 +8,12 @@
   />
   <description>rustree - Fast NTFS Disk Space Analyzer</description>
 
-  <!-- Admin-Rechte anfordern -->
+  <!-- Keine erzwungene Elevation: die App fragt beim Start selbst nach
+       Administratorrechten und startet sich dann neu (wie WinDirStat) -->
   <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
     <security>
       <requestedPrivileges>
-        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+        <requestedExecutionLevel level="asInvoker" uiAccess="false"/>
       </requestedPrivileges>
     </security>
   </trustInfo>
