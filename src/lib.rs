@@ -7,9 +7,11 @@
 //!
 //! - [`mft`] - MFT-Zugriff und Parsing
 //! - [`tree`] - Baum-Datenstrukturen
+//! - [`treemap`] - Größen als Fläche: Layout und Bild
 
 pub mod mft;
 pub mod tree;
+pub mod treemap;
 
 /// Prozessweiter Allokator, gilt für alle Binaries, die diese Library
 /// einbinden. Parser und Baumaufbau legen Millionen kleiner Strings aus

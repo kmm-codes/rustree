@@ -9,16 +9,15 @@
 #![windows_subsystem = "windows"]
 
 use clap::Parser;
-use slint::SharedString;
+use rustree::mft::MftReader;
+use rustree::tree::{format_size, TreeBuilder, TreeNode};
+use rustree::treemap::Treemap;
+use slint::{Image, Model, Rgb8Pixel, SharedPixelBuffer, SharedString, Timer, TimerMode};
 use std::collections::HashSet;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-
-mod mft;
-mod tree;
-
-use mft::MftReader;
-use tree::{format_size, TreeBuilder, TreeNode};
+use std::time::Duration;
 
 // Slint UI einbinden (wird von build.rs kompiliert)
 slint::include_modules!();
@@ -86,11 +85,67 @@ fn attach_parent_console() {
     }
 }
 
+/// Zeilenhöhe der Baumansicht, muss zu ui/main.slint passen
+const ROW_HEIGHT: f32 = 28.0;
+
+/// Sortierung der Baumansicht: Spalte und Richtung
+#[derive(Clone, Copy, PartialEq)]
+struct SortOrder {
+    column: SortColumn,
+    descending: bool,
+}
+
+impl SortOrder {
+    /// Erste Wahl je Spalte: Größe absteigend (wie der Baum ohnehin
+    /// sortiert ist), Namen aufsteigend
+    fn default_for(column: SortColumn) -> Self {
+        Self {
+            column,
+            descending: column == SortColumn::Size,
+        }
+    }
+}
+
 /// Globaler State für Thread-Sicherheit
 struct AppState {
     tree: Option<TreeNode>,
     /// IDs (MFT-Referenzen) der aufgeklappten Ordner
     expanded: HashSet<u64>,
+    sort: SortOrder,
+    /// Markierter Knoten (MFT-Referenz), per Klick in Liste oder Treemap
+    selected: Option<u64>,
+    /// Weg von der Wurzel zu dem Ordner, den die Treemap zeigt
+    /// (leer = das ganze Laufwerk)
+    treemap_root: Vec<u64>,
+    /// Zuletzt gezeichnete Treemap, für Hover und Klick
+    treemap: Option<Treemap>,
+}
+
+impl AppState {
+    fn new() -> Self {
+        Self {
+            tree: None,
+            expanded: HashSet::new(),
+            sort: SortOrder::default_for(SortColumn::Size),
+            selected: None,
+            treemap_root: Vec::new(),
+            treemap: None,
+        }
+    }
+
+    /// Der Ordner, den die Treemap gerade zeigt
+    fn treemap_root_node(&self) -> Option<&TreeNode> {
+        node_at(self.tree.as_ref()?, &self.treemap_root)
+    }
+}
+
+/// Alles, was die GUI-Callbacks teilen
+#[derive(Clone)]
+struct Gui {
+    window: slint::Weak<MainWindow>,
+    state: Arc<Mutex<AppState>>,
+    /// Zähler für Treemap-Renderläufe: nur der jüngste darf sein Bild setzen
+    render_generation: Arc<AtomicU64>,
 }
 
 /// Startet die grafische Benutzeroberfläche
@@ -108,21 +163,19 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         ));
     main_window.set_available_drives(drive_model.into());
 
-    // Thread-sicherer Speicher für den aktuellen Baum
-    let app_state: Arc<Mutex<AppState>> = Arc::new(Mutex::new(AppState {
-        tree: None,
-        expanded: HashSet::new(),
-    }));
+    let gui = Gui {
+        window: main_window.as_weak(),
+        state: Arc::new(Mutex::new(AppState::new())),
+        render_generation: Arc::new(AtomicU64::new(0)),
+    };
 
     // Scan-Callback mit Background-Thread
-    let window_weak = main_window.as_weak();
-    let state_clone = app_state.clone();
-
+    let gui_scan = gui.clone();
     main_window.on_scan_drive(move |drive| {
-        let window = window_weak.unwrap();
+        let window = gui_scan.window.unwrap();
         let drive_str = drive.to_string();
         let window_weak_thread = window.as_weak();
-        let state_for_thread = state_clone.clone();
+        let gui = gui_scan.clone();
 
         window.set_is_scanning(true);
         window.set_status_text(SharedString::from(format!("Initialisiere {}...", drive)));
@@ -139,20 +192,22 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(window) = window_weak_thread.upgrade() {
                     match result {
                         Ok((root_node, timings)) => {
-                            // Baum speichern und GUI aktualisieren
-                            let mut state = state_for_thread.lock().unwrap();
-                            state.expanded.clear();
-
-                            let entries = tree_to_entries(&root_node, &state.expanded);
                             let file_count = root_node.file_count;
                             let dir_count = root_node.dir_count;
 
+                            // Neuer Baum, alles andere auf Anfang - bis auf
+                            // die gewählte Sortierung
+                            let mut state = gui.state.lock().unwrap();
+                            let sort = state.sort;
+                            *state = AppState::new();
+                            state.sort = sort;
                             state.tree = Some(root_node);
+                            refresh_list(&window, &state);
                             drop(state);
 
-                            let entries_model: Rc<slint::VecModel<TreeEntry>> =
-                                Rc::new(slint::VecModel::from(entries));
-                            window.set_tree_entries(entries_model.into());
+                            window.set_treemap_root_text(SharedString::default());
+                            window.set_treemap_hover_text(SharedString::default());
+                            schedule_treemap_render(&gui);
 
                             window.set_status_text(SharedString::from(format!(
                                 "Fertig in {} (Scan {}, Baum {}) - {} Dateien, {} Ordner",
@@ -175,24 +230,28 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         });
     });
 
-    // Toggle-Callback für Baumansicht
-    let window_weak = main_window.as_weak();
-    let state_clone = app_state.clone();
-
+    // Klick auf eine Zeile: Ordner auf- oder zuklappen, Zeile markieren
+    let gui_toggle = gui.clone();
     main_window.on_toggle_entry(move |index| {
-        let window = window_weak.unwrap();
-        let mut state = state_clone.lock().unwrap();
+        let window = gui_toggle.window.unwrap();
+        let mut state = gui_toggle.state.lock().unwrap();
 
         // Baum und Klapp-Zustand getrennt ausleihen - der Baum wird nur
         // gelesen, nie kopiert (bei Millionen Knoten wäre ein Klon pro
         // Klick spürbar)
-        let AppState { tree, expanded } = &mut *state;
+        let AppState {
+            tree,
+            expanded,
+            sort,
+            selected,
+            ..
+        } = &mut *state;
         let Some(tree) = tree.as_ref() else {
             return;
         };
 
         // Finde die ID des geklickten Eintrags anhand des Index
-        let visible = collect_visible_ids(tree, expanded);
+        let visible = collect_visible_ids(tree, expanded, *sort);
         let Some(&clicked) = visible.get(index as usize) else {
             return;
         };
@@ -201,12 +260,105 @@ fn run_gui() -> Result<(), Box<dyn std::error::Error>> {
         if !expanded.remove(&clicked) {
             expanded.insert(clicked);
         }
+        *selected = Some(clicked);
 
-        // GUI aktualisieren
-        let new_entries = tree_to_entries(tree, expanded);
-        let entries_model: Rc<slint::VecModel<TreeEntry>> =
-            Rc::new(slint::VecModel::from(new_entries));
-        window.set_tree_entries(entries_model.into());
+        refresh_list(&window, &state);
+    });
+
+    // Klick auf einen Spaltenkopf: Spalte wechseln oder Richtung umdrehen
+    let gui_sort = gui.clone();
+    main_window.on_sort_by(move |column| {
+        let window = gui_sort.window.unwrap();
+        let mut state = gui_sort.state.lock().unwrap();
+        state.sort = if state.sort.column == column {
+            SortOrder {
+                column,
+                descending: !state.sort.descending,
+            }
+        } else {
+            SortOrder::default_for(column)
+        };
+        refresh_list(&window, &state);
+    });
+
+    // Größenänderung des Treemap-Bereichs: erst zeichnen, wenn Ruhe ist -
+    // beim Ziehen des Fensters kommen Dutzende Änderungen pro Sekunde
+    let gui_resize = gui.clone();
+    let resize_timer = Rc::new(Timer::default());
+    main_window.on_treemap_resized(move || {
+        let gui = gui_resize.clone();
+        resize_timer.start(TimerMode::SingleShot, Duration::from_millis(150), move || {
+            schedule_treemap_render(&gui);
+        });
+    });
+
+    // Maus über der Treemap: Pfad und Größe anzeigen
+    let gui_hover = gui.clone();
+    main_window.on_treemap_hover(move |x, y| {
+        let window = gui_hover.window.unwrap();
+        let state = gui_hover.state.lock().unwrap();
+        let text = treemap_hit(&window, &state, x, y)
+            .and_then(|chain| describe(state.tree.as_ref()?, &chain))
+            .unwrap_or_default();
+        window.set_treemap_hover_text(SharedString::from(text));
+    });
+
+    // Klick in die Treemap: den Eintrag im Baum aufklappen und markieren
+    let gui_click = gui.clone();
+    main_window.on_treemap_clicked(move |x, y| {
+        let window = gui_click.window.unwrap();
+        let mut state = gui_click.state.lock().unwrap();
+        let Some(chain) = treemap_hit(&window, &state, x, y) else {
+            return;
+        };
+        let Some((&target, ancestors)) = chain.split_last() else {
+            return;
+        };
+        state.expanded.extend(ancestors.iter().copied());
+        state.selected = Some(target);
+        refresh_list(&window, &state);
+        scroll_to_selected(&window);
+    });
+
+    // Doppelklick: in den Ordner unter der Maus absteigen
+    let gui_descend = gui.clone();
+    main_window.on_treemap_descend(move |x, y| {
+        let window = gui_descend.window.unwrap();
+        let mut state = gui_descend.state.lock().unwrap();
+        let Some(chain) = treemap_hit(&window, &state, x, y) else {
+            return;
+        };
+        // Das erste Glied unterhalb der aktuellen Wurzel
+        let Some(&next) = chain.get(state.treemap_root.len()) else {
+            return;
+        };
+        let mut new_root = state.treemap_root.clone();
+        new_root.push(next);
+        let is_directory = state
+            .tree
+            .as_ref()
+            .and_then(|tree| node_at(tree, &new_root))
+            .is_some_and(|node| node.is_directory && !node.children.is_empty());
+        if !is_directory {
+            return;
+        }
+        state.treemap_root = new_root;
+        show_treemap_root(&window, &state);
+        drop(state);
+        schedule_treemap_render(&gui_descend);
+    });
+
+    // "Hoch": eine Ebene zurück
+    let gui_ascend = gui.clone();
+    main_window.on_treemap_ascend(move || {
+        let window = gui_ascend.window.unwrap();
+        let mut state = gui_ascend.state.lock().unwrap();
+        if state.treemap_root.pop().is_none() {
+            return;
+        }
+        show_treemap_root(&window, &state);
+        drop(state);
+        schedule_treemap_render(&gui_ascend);
     });
 
     main_window.run()?;
@@ -279,62 +431,218 @@ fn format_duration(duration: std::time::Duration) -> String {
     }
 }
 
-/// Konvertiert den Baum in flache TreeEntry-Liste für die GUI
-///
-/// Nur die Kinder der Wurzel und darunter die aufgeklappten Ordner.
-fn tree_to_entries(root: &TreeNode, expanded: &HashSet<u64>) -> Vec<TreeEntry> {
-    let mut entries = Vec::new();
-    for child in &root.children {
-        add_node_to_entries(child, expanded, 0, &mut entries);
+/// Baut die Liste neu auf und zeigt Markierung und Sortierung an
+fn refresh_list(window: &MainWindow, state: &AppState) {
+    let Some(tree) = state.tree.as_ref() else {
+        return;
+    };
+    let entries = tree_to_entries(tree, &state.expanded, state.sort);
+    let selected_index = state
+        .selected
+        .and_then(|id| {
+            collect_visible_ids(tree, &state.expanded, state.sort)
+                .iter()
+                .position(|&visible| visible == id)
+        })
+        .map_or(-1, |index| index as i32);
+
+    let entries_model: Rc<slint::VecModel<TreeEntry>> = Rc::new(slint::VecModel::from(entries));
+    window.set_tree_entries(entries_model.into());
+    window.set_selected_index(selected_index);
+    window.set_sort_column(state.sort.column);
+    window.set_sort_descending(state.sort.descending);
+}
+
+/// Scrollt die Liste so, dass die markierte Zeile in der Mitte liegt
+fn scroll_to_selected(window: &MainWindow) {
+    let index = window.get_selected_index();
+    if index < 0 {
+        return;
     }
+    let visible = window.get_list_height();
+    let total = window.get_tree_entries().row_count() as f32 * ROW_HEIGHT;
+    let wanted = -(index as f32 * ROW_HEIGHT) + visible / 2.0 - ROW_HEIGHT / 2.0;
+    let lowest = (visible - total).min(0.0);
+    window.set_list_viewport_y(wanted.clamp(lowest, 0.0));
+}
+
+/// Zeigt den Pfad der Treemap-Wurzel im Kopf (leer für das Laufwerk)
+fn show_treemap_root(window: &MainWindow, state: &AppState) {
+    let text = if state.treemap_root.is_empty() {
+        String::new()
+    } else {
+        state
+            .tree
+            .as_ref()
+            .and_then(|tree| path_of(tree, &state.treemap_root))
+            .unwrap_or_default()
+    };
+    window.set_treemap_root_text(SharedString::from(text));
+}
+
+/// Zeichnet die Treemap in der Größe des Anzeigebereichs, im Hintergrund
+///
+/// Das Bild entsteht in Gerätepixeln (Slint rechnet in logischen Pixeln,
+/// bei 125 % Skalierung also 1,25 Gerätepixel je Einheit), damit es scharf
+/// bleibt. Kommt vor dem Ende ein neuer Auftrag - Fenster wird weiter
+/// gezogen -, verwirft der ältere sein Ergebnis.
+fn schedule_treemap_render(gui: &Gui) {
+    let Some(window) = gui.window.upgrade() else {
+        return;
+    };
+    let scale = window.window().scale_factor();
+    let width = (window.get_treemap_width() * scale).round() as u32;
+    let height = (window.get_treemap_height() * scale).round() as u32;
+    if width == 0 || height == 0 {
+        return;
+    }
+
+    let my_generation = gui.render_generation.fetch_add(1, Ordering::SeqCst) + 1;
+    let gui = gui.clone();
+    std::thread::spawn(move || {
+        let map = {
+            let state = gui.state.lock().unwrap();
+            let Some(root) = state.treemap_root_node() else {
+                return;
+            };
+            Treemap::render(root, width, height)
+        };
+        if gui.render_generation.load(Ordering::SeqCst) != my_generation {
+            return; // überholt
+        }
+
+        let _ = slint::invoke_from_event_loop(move || {
+            let Some(window) = gui.window.upgrade() else {
+                return;
+            };
+            if gui.render_generation.load(Ordering::SeqCst) != my_generation {
+                return;
+            }
+            let buffer =
+                SharedPixelBuffer::<Rgb8Pixel>::clone_from_slice(map.pixels(), map.width(), map.height());
+            window.set_treemap_image(Image::from_rgb8(buffer));
+            gui.state.lock().unwrap().treemap = Some(map);
+        });
+    });
+}
+
+/// Der Knoten unter einem Mauspunkt der Treemap, als Kette von IDs ab der
+/// Baumwurzel (die gezeigte Treemap-Wurzel inklusive)
+fn treemap_hit(window: &MainWindow, state: &AppState, x: f32, y: f32) -> Option<Vec<u64>> {
+    if x < 0.0 || y < 0.0 {
+        return None;
+    }
+    let scale = window.window().scale_factor();
+    let hit = state
+        .treemap
+        .as_ref()?
+        .hit((x * scale) as f64, (y * scale) as f64)?;
+    let mut chain = state.treemap_root.clone();
+    chain.extend_from_slice(hit.chain);
+    Some(chain)
+}
+
+/// Text für die Hover-Zeile: Pfad und Größe, bei Ordnern auch die Dateizahl
+fn describe(tree: &TreeNode, chain: &[u64]) -> Option<String> {
+    let node = node_at(tree, chain)?;
+    let path = path_of(tree, chain)?;
+    Some(if node.is_directory {
+        format!(
+            "{} - {} ({} Dateien)",
+            path,
+            format_size(node.total_size),
+            node.file_count
+        )
+    } else {
+        format!("{} - {}", path, format_size(node.total_size))
+    })
+}
+
+/// Folgt einer Kette von IDs von der Wurzel nach unten
+fn node_at<'a>(root: &'a TreeNode, chain: &[u64]) -> Option<&'a TreeNode> {
+    let mut node = root;
+    for &id in chain {
+        node = node.children.iter().find(|child| child.id == id)?;
+    }
+    Some(node)
+}
+
+/// Voller Pfad zu einer Kette von IDs, mit Backslashes wie im Explorer
+fn path_of(root: &TreeNode, chain: &[u64]) -> Option<String> {
+    let mut path = root.name.clone();
+    let mut node = root;
+    for &id in chain {
+        node = node.children.iter().find(|child| child.id == id)?;
+        path.push('\\');
+        path.push_str(&node.name);
+    }
+    Some(path)
+}
+
+/// Die Kinder eines Knotens in der gewählten Sortierung
+///
+/// Der Baum selbst ist nach Größe absteigend sortiert; alles andere wird
+/// nur für die sichtbaren Ordner umsortiert, nie für den ganzen Baum.
+fn ordered_children(node: &TreeNode, sort: SortOrder) -> Vec<&TreeNode> {
+    let mut children: Vec<&TreeNode> = node.children.iter().collect();
+    if sort.column == SortColumn::Name {
+        children.sort_by_cached_key(|child| child.name.to_lowercase());
+        if sort.descending {
+            children.reverse();
+        }
+    } else if !sort.descending {
+        children.reverse();
+    }
+    children
+}
+
+/// Läuft über die sichtbaren Knoten in Listenreihenfolge: die Kinder der
+/// Wurzel und darunter die aufgeklappten Ordner
+fn visit_visible<'a, F>(root: &'a TreeNode, expanded: &HashSet<u64>, sort: SortOrder, visit: &mut F)
+where
+    F: FnMut(&'a TreeNode, i32, bool),
+{
+    fn walk<'a, F>(node: &'a TreeNode, expanded: &HashSet<u64>, sort: SortOrder, depth: i32, visit: &mut F)
+    where
+        F: FnMut(&'a TreeNode, i32, bool),
+    {
+        let is_expanded = node.is_directory && expanded.contains(&node.id);
+        visit(node, depth, is_expanded);
+        if is_expanded {
+            for child in ordered_children(node, sort) {
+                walk(child, expanded, sort, depth + 1, visit);
+            }
+        }
+    }
+
+    for child in ordered_children(root, sort) {
+        walk(child, expanded, sort, 0, visit);
+    }
+}
+
+/// Konvertiert den Baum in flache TreeEntry-Liste für die GUI
+fn tree_to_entries(root: &TreeNode, expanded: &HashSet<u64>, sort: SortOrder) -> Vec<TreeEntry> {
+    let mut entries = Vec::new();
+    visit_visible(root, expanded, sort, &mut |node, depth, is_expanded| {
+        entries.push(TreeEntry {
+            name: SharedString::from(&node.name),
+            size: SharedString::from(format_size(node.total_size)),
+            size_bytes: node.total_size as f32,
+            is_directory: node.is_directory,
+            depth,
+            expanded: is_expanded,
+            has_children: node.is_directory && !node.children.is_empty(),
+        });
+    });
     entries
 }
 
 /// Sammelt die IDs der sichtbaren Knoten in der gleichen Reihenfolge wie
 /// tree_to_entries, um einen Listen-Index einem Knoten zuzuordnen
-fn collect_visible_ids(root: &TreeNode, expanded: &HashSet<u64>) -> Vec<u64> {
+fn collect_visible_ids(root: &TreeNode, expanded: &HashSet<u64>, sort: SortOrder) -> Vec<u64> {
     let mut ids = Vec::new();
-    for child in &root.children {
-        collect_node_ids(child, expanded, &mut ids);
-    }
+    visit_visible(root, expanded, sort, &mut |node, _, _| ids.push(node.id));
     ids
-}
-
-/// Rekursive Hilfsfunktion für collect_visible_ids
-fn collect_node_ids(node: &TreeNode, expanded: &HashSet<u64>, ids: &mut Vec<u64>) {
-    ids.push(node.id);
-    if node.is_directory && expanded.contains(&node.id) {
-        for child in &node.children {
-            collect_node_ids(child, expanded, ids);
-        }
-    }
-}
-
-/// Rekursive Hilfsfunktion für tree_to_entries
-fn add_node_to_entries(
-    node: &TreeNode,
-    expanded: &HashSet<u64>,
-    depth: i32,
-    entries: &mut Vec<TreeEntry>,
-) {
-    let is_expanded = node.is_directory && expanded.contains(&node.id);
-
-    entries.push(TreeEntry {
-        name: SharedString::from(&node.name),
-        size: SharedString::from(format_size(node.total_size)),
-        size_bytes: node.total_size as f32,
-        is_directory: node.is_directory,
-        depth,
-        expanded: is_expanded,
-        has_children: node.is_directory && !node.children.is_empty(),
-    });
-
-    // Kinder hinzufügen wenn expanded
-    if is_expanded {
-        for child in &node.children {
-            add_node_to_entries(child, expanded, depth + 1, entries);
-        }
-    }
 }
 
 /// CLI-Modus ohne GUI

@@ -15,6 +15,9 @@ export struct TreeEntry {
     has_children: bool,
 }
 
+// Spalten der Baumansicht, nach denen sortiert werden kann
+export enum SortColumn { name, size }
+
 // Hauptfenster
 export component MainWindow inherits Window {
     title: "rustree - Disk Space Analyzer";
@@ -30,9 +33,33 @@ export component MainWindow inherits Window {
     in-out property <bool> is_scanning: false;
     in-out property <string> status_text: "Bereit";
 
+    // Sortierung der Baumansicht; Rust hält den Zustand, die GUI zeigt ihn
+    in-out property <SortColumn> sort_column: SortColumn.size;
+    in-out property <bool> sort_descending: true;
+
+    // Markierte Zeile (Index in tree_entries), -1 = keine; Rust scrollt
+    // sie über list_viewport_y ins Bild
+    in-out property <int> selected_index: -1;
+    in-out property <length> list_viewport_y <=> list.viewport-y;
+    out property <length> list_height: list.visible-height;
+
+    // Treemap: fertiges Bild aus Rust, Pfad der gezeigten Wurzel, Hover-Text
+    in-out property <image> treemap_image;
+    in-out property <string> treemap_root_text: "";
+    in-out property <string> treemap_hover_text: "";
+    // Größe des Zeichenbereichs, damit Rust das Bild passend rendert
+    out property <length> treemap_width: treemap_area.width;
+    out property <length> treemap_height: treemap_area.height;
+
     // Callbacks nach Rust
     callback scan_drive(string);
     callback toggle_entry(int);
+    callback sort_by(SortColumn);
+    callback treemap_resized();
+    callback treemap_hover(float, float);
+    callback treemap_clicked(float, float);
+    callback treemap_descend(float, float);
+    callback treemap_ascend();
 
     VerticalBox {
         padding: 16px;
@@ -93,15 +120,67 @@ export component MainWindow inherits Window {
 
                 VerticalBox {
                     padding: 8px;
+                    spacing: 4px;
 
-                    Text {
-                        text: "Verzeichnisse";
-                        color: #cdd6f4;
-                        font-size: 14px;
-                        font-weight: 600;
+                    // Spaltenköpfe: Klick sortiert, zweiter Klick dreht um.
+                    // Gleiche Geometrie wie die Zeilen darunter.
+                    Rectangle {
+                        height: 28px;
+
+                        name_header := TouchArea {
+                            x: 0;
+                            width: parent.width - 96px;
+                            height: parent.height;
+                            clicked => { root.sort_by(SortColumn.name); }
+
+                            Rectangle {
+                                background: parent.has-hover ? #45475a : transparent;
+                                border-radius: 4px;
+
+                                Text {
+                                    x: 8px;
+                                    width: parent.width - 16px;
+                                    height: parent.height;
+                                    text: root.sort_column == SortColumn.name
+                                        ? (root.sort_descending ? "Name ▼" : "Name ▲")
+                                        : "Name";
+                                    color: #cdd6f4;
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                    overflow: elide;
+                                }
+                            }
+                        }
+
+                        size_header := TouchArea {
+                            x: parent.width - 96px;
+                            width: 96px;
+                            height: parent.height;
+                            clicked => { root.sort_by(SortColumn.size); }
+
+                            Rectangle {
+                                background: parent.has-hover ? #45475a : transparent;
+                                border-radius: 4px;
+
+                                Text {
+                                    x: 8px;
+                                    width: parent.width - 16px;
+                                    height: parent.height;
+                                    text: root.sort_column == SortColumn.size
+                                        ? (root.sort_descending ? "Größe ▼" : "Größe ▲")
+                                        : "Größe";
+                                    color: #cdd6f4;
+                                    font-size: 14px;
+                                    font-weight: 600;
+                                    horizontal-alignment: right;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
                     }
 
-                    ListView {
+                    list := ListView {
                         // Feste Positionierung statt HorizontalBox: die Zeile
                         // bleibt genau so breit wie die Liste (ein Layout würde
                         // sich an langen Namen orientieren und die Liste
@@ -110,7 +189,8 @@ export component MainWindow inherits Window {
                         // greift statt die Zeile ganz zu verwerfen.
                         for entry[index] in tree_entries: Rectangle {
                             height: 28px;
-                            background: touch.has-hover ? #45475a : transparent;
+                            background: index == root.selected_index ? #585b70
+                                : touch.has-hover ? #45475a : transparent;
 
                             property <length> indent: entry.depth * 20px + 8px;
 
@@ -174,26 +254,79 @@ export component MainWindow inherits Window {
 
                 VerticalBox {
                     padding: 8px;
+                    spacing: 4px;
 
-                    Text {
-                        text: "Treemap";
-                        color: #cdd6f4;
-                        font-size: 14px;
-                        font-weight: 600;
+                    // Kopf: Titel, Pfad der gezeigten Wurzel, Hoch-Knopf
+                    HorizontalBox {
+                        padding: 0;
+                        spacing: 8px;
+                        height: 28px;
+
+                        Text {
+                            text: "Treemap";
+                            color: #cdd6f4;
+                            font-size: 14px;
+                            font-weight: 600;
+                            vertical-alignment: center;
+                        }
+
+                        Text {
+                            text: treemap_root_text;
+                            color: #a6adc8;
+                            vertical-alignment: center;
+                            overflow: elide;
+                            horizontal-stretch: 1;
+                        }
+
+                        Button {
+                            text: "Hoch";
+                            enabled: treemap_root_text != "";
+                            clicked => { root.treemap_ascend(); }
+                        }
                     }
 
-                    // Placeholder für Treemap (wird später implementiert)
-                    Rectangle {
+                    // Zeichenbereich: das Bild kommt aus Rust, in genau
+                    // dieser Größe; Größenänderungen lösen ein neues aus
+                    treemap_area := Rectangle {
                         background: #1e1e2e;
                         border-radius: 4px;
                         vertical-stretch: 1;
+                        clip: true;
 
-                        Text {
-                            text: tree_entries.length > 0 ? "Treemap Visualisierung\n(Phase 5)" : "Starte einen Scan...";
+                        changed width => { root.treemap_resized(); }
+                        changed height => { root.treemap_resized(); }
+
+                        Image {
+                            width: parent.width;
+                            height: parent.height;
+                            source: treemap_image;
+                            image-fit: fill;
+                        }
+
+                        if tree_entries.length == 0: Text {
+                            text: "Starte einen Scan...";
                             color: #6c7086;
                             horizontal-alignment: center;
                             vertical-alignment: center;
                         }
+
+                        map_touch := TouchArea {
+                            moved => { root.treemap_hover(self.mouse-x / 1px, self.mouse-y / 1px); }
+                            clicked => { root.treemap_clicked(self.mouse-x / 1px, self.mouse-y / 1px); }
+                            double-clicked => { root.treemap_descend(self.mouse-x / 1px, self.mouse-y / 1px); }
+                            changed has-hover => {
+                                if (!self.has-hover) { root.treemap_hover(-1, -1); }
+                            }
+                        }
+                    }
+
+                    // Was unter der Maus liegt
+                    Text {
+                        height: 20px;
+                        text: treemap_hover_text;
+                        color: #a6adc8;
+                        vertical-alignment: center;
+                        overflow: elide;
                     }
                 }
             }
