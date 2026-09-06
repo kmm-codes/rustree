@@ -65,15 +65,29 @@ Baut aus den flachen MFT-Daten eine Baumstruktur.
 ```rust
 // Hauptkomponenten
 TreeNode     - Ein Knoten (Datei oder Ordner)
-TreeBuilder  - Konstruiert den Baum aus HashMap<MftRef, FileEntry>
+TreeBuilder  - Konstruiert den Baum aus Vec<FileEntry> über einen dichten Index
 ```
 
 **Der Trick:**
 Die MFT gibt uns nur `parent_reference` - wir müssen selbst den Baum bauen!
 
-### 3. Treemap-Modul (`src/treemap/`) - Coming Soon
+### 3. Treemap-Modul (`src/treemap/`)
 
-Visualisiert den Baum als Rechteck-Diagramm.
+Visualisiert den Baum als Rechteck-Diagramm: jeder Knoten bekommt eine
+Fläche proportional zu seiner Größe, die Kinder teilen die Fläche ihres
+Ordners (Squarified-Layout nach Bruls, Huizing und van Wijk).
+
+```rust
+// Hauptkomponenten
+layout()     - Verteilt eine Fläche auf Größen, möglichst quadratisch
+Treemap      - Zeichnet den Baum in einen RGB-Puffer und merkt sich je
+               Rechteck den Weg zum Knoten (für Hover und Klick)
+```
+
+**Der Trick:** Millionen Knoten passen nicht als GUI-Elemente auf den
+Bildschirm. Die Treemap wird deshalb als fertiges Bild in der Größe des
+Anzeigebereichs gezeichnet; Knoten unter einem Pixel werden samt Teilbaum
+übersprungen. Der Aufwand hängt an der Bildgröße, nicht an der Dateizahl.
 
 ### 4. UI-Modul (`ui/`)
 
@@ -97,7 +111,7 @@ Slint-basierte GUI mit:
 4. MftParser liest jeden Record
         │
         ▼
-5. HashMap<u64, FileEntry> mit allen Dateien
+5. Vec<FileEntry> mit allen Dateien (Erweiterungs-Records zusammengeführt)
         │
         ▼
 6. TreeBuilder baut Baum auf
@@ -114,8 +128,8 @@ Slint-basierte GUI mit:
 | Modul | Rust-Konzepte |
 |-------|---------------|
 | MFT | unsafe (Windows API), FFI, Result/Error |
-| Tree | HashMap, Rekursion, Ownership, Clone |
-| Treemap | Generics, Iterators (kommt noch) |
+| Tree | Dichte Indizes statt HashMap, Rekursion, Ownership, rayon |
+| Treemap | f64-Geometrie, Rekursion mit Abbruch, Pixelpuffer, Lifetimes |
 | UI | Callbacks, Arc/Mutex, Threading, Closures |
 
 ## Threading-Architektur

@@ -19,12 +19,15 @@ und die [Milestones](https://github.com/kmm-codes/rustree/milestones) je Phase v
 | 1. Projekt-Setup | ✅ Fertig | Cargo, Slint, Dependencies |
 | 2. MFT-Reader | ✅ Fertig | Raw-Disk-Zugriff, Boot-Sektor, Record-Parsing |
 | 3. Baum-Datenstruktur | ✅ Fertig | TreeNode, TreeBuilder, Größenaggregation |
-| 4. GUI Baumansicht | 🔄 In Arbeit | Aufklappbare Liste, Background-Threading |
-| 5. Treemap | ⏳ Ausstehend | Squarified-Algorithmus |
+| 4. GUI Baumansicht | ✅ Fertig | Aufklappbare Liste, Sortierung per Spaltenkopf, Markierung |
+| 5. Treemap | ✅ Fertig | Squarified-Layout als Bild, Hover, Klick wählt im Baum, Doppelklick steigt ab |
 | 6. CLI & Polish | ⏳ Ausstehend | Export, Feinschliff |
 
 ### Letzte Änderungen
 
+- **Treemap**: Größen als Fläche, Farbe nach Dateiendung; Hover zeigt Pfad und Größe, Klick markiert den Eintrag im Baum, Doppelklick zoomt in den Ordner
+- **Sortierung**: Klick auf "Name" oder "Größe" sortiert die Liste, zweiter Klick dreht die Richtung
+- **Scan in 3 Sekunden**: MFT ohne Cache mit vier parallelen Lesern, Erweiterungs-Records für die größten Dateien, Baum über einen dichten Index (C: mit 3,8 Mio Einträgen: 2,9 s statt 21 s)
 - **Vollständiger MFT-Scan**: Der Reader folgt den Data Runs der `$MFT`, wendet Fixups an und bevorzugt lange Windows-Namen
 - **Baumliste**: Namen werden angezeigt und bei Platzmangel gekürzt, Skia-Renderer für saubere Schrift
 - **Setup und Dev-Loop**: `scripts/release.ps1` baut ein NSIS-Setup, `scripts/update.ps1` ersetzt die installierte EXE

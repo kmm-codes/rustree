@@ -47,15 +47,15 @@ Mit spezifischem Laufwerk:
 ┌─────────────────────────────────────────────────────────────┐
 │  Laufwerk: [C: ▼]  [Scannen]              Status: Bereit    │
 ├────────────────────────────┬────────────────────────────────┤
-│  Verzeichnisse             │  Treemap                       │
-│  ─────────────────         │  ────────                      │
-│  ▶ 📁 Windows     25.3 GB  │                                │
-│  ▶ 📁 Program...  15.7 GB  │      ┌────────────────────┐    │
-│  ▼ 📁 Users       45.2 GB  │      │                    │    │
-│    ▶ 📁 kevin     42.1 GB  │      │   (Visualisierung  │    │
-│    ▶ 📁 Public     3.1 GB  │      │    kommt später)   │    │
-│  📄 pagefile.sys   8.0 GB  │      │                    │    │
-│                            │      └────────────────────┘    │
+│  Name              Größe ▼ │  Treemap  C:\Users     [Hoch] │
+│  ─────────────────         │  ┌──────────────┬──────┬────┐ │
+│  ▶ 📁 Windows     25.3 GB  │  │              │      │    │ │
+│  ▶ 📁 Program...  15.7 GB  │  │              ├──────┴────┤ │
+│  ▼ 📁 Users       45.2 GB  │  │              │ ▪▪▪▪▪▪▪▪▪ │ │
+│    ▶ 📁 kevin     42.1 GB  │  ├──────┬───────┤ ▪▪▪▪▪▪▪▪▪ │ │
+│    ▶ 📁 Public     3.1 GB  │  │      │       │ ▪▪▪▪▪▪▪▪▪ │ │
+│  📄 pagefile.sys   8.0 GB  │  └──────┴───────┴───────────┘ │
+│                            │  C:\Users\kevin\video.mp4 - 1 GB│
 └────────────────────────────┴────────────────────────────────┘
 ```
 
@@ -64,7 +64,12 @@ Mit spezifischem Laufwerk:
 1. **Laufwerk wählen**: Dropdown-Menü oben links
 2. **Scannen**: Klick auf "Scannen" startet den MFT-Scan
 3. **Ordner aufklappen**: Klick auf ▶ um Unterordner zu sehen
-4. **Größen**: Rechts siehst du die Gesamtgröße jedes Ordners
+4. **Sortieren**: Klick auf "Name" oder "Größe" im Spaltenkopf, ein
+   zweiter Klick dreht die Richtung um
+5. **Treemap**: Jede Kachel ist eine Datei, ihre Fläche die Größe, ihre
+   Farbe die Dateiendung. Die Maus darüber zeigt Pfad und Größe, ein Klick
+   markiert die Datei im Baum, ein Doppelklick zoomt in den Ordner - "Hoch"
+   führt wieder eine Ebene zurück
 
 ## Was passiert beim Scan?
 

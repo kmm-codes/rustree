@@ -91,6 +91,7 @@ rustree/
     lib.rs            Library-Exports für Tests
     mft/              MFT-Zugriff: Raw-Disk-Reader, Record-Parser, Typen
     tree/             Baum-Datenstruktur mit Größenaggregation
+    treemap/          Squarified-Layout und Bild der Treemap
   ui/main.slint       GUI-Definition (Slint)
   tests/              Integrationstests
   examples/           ui_preview (GUI ohne Scan), scan_bench (MFT-Dump messen)
