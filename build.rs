@@ -21,10 +21,12 @@ fn embed_windows_resources() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let manifest = manifest_dir.join("rustree.manifest");
+    let icon = manifest_dir.join("assets/rustree.ico");
 
     // Slint meldet bereits rerun-if-changed, also müssen wir alles nennen,
     // was diese Ressourcen beeinflusst - Cargo.toml wegen der Version.
     println!("cargo:rerun-if-changed={}", manifest.display());
+    println!("cargo:rerun-if-changed={}", icon.display());
     println!("cargo:rerun-if-changed=Cargo.toml");
 
     let version = env::var("CARGO_PKG_VERSION").unwrap();
@@ -32,6 +34,7 @@ fn embed_windows_resources() {
     let minor = env::var("CARGO_PKG_VERSION_MINOR").unwrap();
     let patch = env::var("CARGO_PKG_VERSION_PATCH").unwrap();
     let manifest = manifest.display().to_string().replace('\\', "\\\\");
+    let icon = icon.display().to_string().replace('\\', "\\\\");
 
     let rc = format!(
         r#"// Generiert von build.rs - nicht von Hand bearbeiten.
@@ -40,8 +43,8 @@ fn embed_windows_resources() {
 // Manifest einbinden (ID 1 = CREATEPROCESS_MANIFEST_RESOURCE_ID)
 1 RT_MANIFEST "{manifest}"
 
-// Optional: App-Icon (später hinzufügen)
-// 1 ICON "assets/rustree.ico"
+// App-Icon für Explorer, Taskleiste und Verknüpfungen
+1 ICON "{icon}"
 
 VS_VERSION_INFO VERSIONINFO
 FILEVERSION {major},{minor},{patch},0
