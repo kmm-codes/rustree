@@ -76,6 +76,11 @@ Mit spezifischem Laufwerk:
    Farbe die Dateiendung. Die Maus darüber zeigt Pfad und Größe, ein Klick
    markiert die Datei im Baum, ein Doppelklick zoomt in den Ordner - "Hoch"
    führt wieder eine Ebene zurück
+6. **Rechtsklick-Kontextmenü**: auf einer Zeile im Baum öffnet es "Im
+   Explorer öffnen", "Pfad kopieren", "In Treemap zeigen" (nur bei Ordnern
+   mit Inhalt) und "Löschen (Papierkorb)". Löschen verschiebt in den
+   Papierkorb (mit eigener Rückfrage vorher) und aktualisiert den Baum
+   sofort - ohne dass neu gescannt werden muss
 
 ## Was passiert beim Scan?
 

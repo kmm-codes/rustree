@@ -3992,6 +3992,7 @@ version = "0.1.0"
 dependencies = [
  "byteorder",
  "clap",
+ "clipboard-win",
  "embed-resource",
  "humansize",
  "mimalloc",

@@ -44,6 +44,10 @@ windows = { version = "0.58", features = [
 # Nativer Ordner-Dialog (IFileDialog) für "Ordner wählen"
 rfd = "0.15"
 
+# Pfad ins Zwischenablage kopieren (Kontextmenü "Pfad kopieren") - kapselt
+# OpenClipboard/SetClipboardData, braucht dafür keinen eigenen unsafe-Code
+clipboard-win = "5"
+
 # CLI parsing
 clap = { version = "4", features = ["derive"] }
 

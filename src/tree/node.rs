@@ -129,6 +129,41 @@ impl TreeNode {
     pub fn node_count(&self) -> u64 {
         1 + self.children.iter().map(|c| c.node_count()).sum::<u64>()
     }
+
+    /// Entfernt den Nachfahren an `chain` (Weg von IDs ab `self`, wie ihn
+    /// `visible_chain_at` in main.rs liefert) aus dem Baum und gibt ihn
+    /// zurück. Auf dem Weg dorthin werden `total_size`, `file_count` und
+    /// `dir_count` aller Vorfahren um die Werte des entfernten Knotens
+    /// verringert - so bleibt der Baum konsistent, ohne dass jemand ihn
+    /// neu aufbauen muss (das würde bei Millionen Knoten spürbar dauern).
+    ///
+    /// Für den Aufrufer (GUI nach "Löschen"): `self` ist die Baumwurzel,
+    /// `chain` die Kette zum gelöschten Knoten. Eine leere Kette (die
+    /// Wurzel selbst) oder eine Kette, die im Baum nicht existiert, geben
+    /// `None` zurück und lassen den Baum unangetastet.
+    pub fn remove_descendant(&mut self, chain: &[u64]) -> Option<TreeNode> {
+        let (&id, rest) = chain.split_first()?;
+
+        let removed = if rest.is_empty() {
+            // `id` ist ein direktes Kind von `self` - hier endet der Weg
+            let index = self.children.iter().position(|child| child.id == id)?;
+            self.children.remove(index)
+        } else {
+            // Weiter absteigen; der nächste Schritt existiert nur, wenn
+            // die Kette zu einem echten Nachfahren gehört
+            let child = self.children.iter_mut().find(|child| child.id == id)?;
+            child.remove_descendant(rest)?
+        };
+
+        // Erst nach erfolgreichem Entfernen abziehen - bricht die Suche
+        // irgendwo auf dem Weg ab (Kette falsch), bleibt dank des `?` oben
+        // vorher nichts verändert.
+        self.total_size -= removed.total_size;
+        self.file_count -= removed.file_count;
+        self.dir_count -= removed.dir_count;
+
+        Some(removed)
+    }
 }
 
 /// Formatiert eine Größe in Bytes als human-readable String
@@ -171,3 +206,123 @@ impl PartialEq for TreeNode {
 }
 
 impl Eq for TreeNode {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Baut C: > Users > kevin > {photo.jpg, docs > notes.txt} sowie
+    /// C: > pagefile.sys auf, mit IDs statt der Default-0, damit sich
+    /// remove_descendant über eine echte Kette ansteuern lässt.
+    fn sample_tree() -> TreeNode {
+        let mut root = TreeNode::new_directory("C:".to_string());
+        root.id = 1;
+
+        let mut users = TreeNode::new_directory("Users".to_string());
+        users.id = 2;
+
+        let mut kevin = TreeNode::new_directory("kevin".to_string());
+        kevin.id = 3;
+
+        let mut photo = TreeNode::new_file("photo.jpg".to_string(), 2000);
+        photo.id = 4;
+
+        let mut docs = TreeNode::new_directory("docs".to_string());
+        docs.id = 5;
+        let mut notes = TreeNode::new_file("notes.txt".to_string(), 100);
+        notes.id = 6;
+        docs.add_child(notes);
+
+        kevin.add_child(photo);
+        kevin.add_child(docs);
+        users.add_child(kevin);
+        root.add_child(users);
+
+        let mut pagefile = TreeNode::new_file("pagefile.sys".to_string(), 5000);
+        pagefile.id = 7;
+        root.add_child(pagefile);
+
+        root
+    }
+
+    #[test]
+    fn remove_descendant_updates_all_ancestors() {
+        let mut root = sample_tree();
+
+        // notes.txt (ID 6) liegt unter Users(2) > kevin(3) > docs(5)
+        let removed = root
+            .remove_descendant(&[2, 3, 5, 6])
+            .expect("notes.txt sollte gefunden werden");
+        assert_eq!(removed.name, "notes.txt");
+        assert_eq!(removed.total_size, 100);
+
+        // docs(5) hat kein Kind mehr, ist aber selbst noch da (nur die
+        // Datei sollte entfernt worden sein, nicht ihr Elternordner)
+        let docs = &root.children[0].children[0].children[1];
+        assert_eq!(docs.name, "docs");
+        assert!(docs.children.is_empty());
+        assert_eq!(docs.total_size, 0);
+        assert_eq!(docs.file_count, 0);
+
+        // kevin(3), Users(2) und die Wurzel müssen die Größe/Zähler
+        // ebenfalls um den entfernten Knoten verringert haben
+        let kevin = &root.children[0].children[0];
+        assert_eq!(kevin.total_size, 2000); // nur noch photo.jpg
+        assert_eq!(kevin.file_count, 1);
+
+        let users = &root.children[0];
+        assert_eq!(users.total_size, 2000);
+        assert_eq!(users.file_count, 1);
+
+        assert_eq!(root.total_size, 2000 + 5000); // photo.jpg + pagefile.sys
+        assert_eq!(root.file_count, 2);
+        // dir_count sinkt nicht, weil eine Datei entfernt wurde, kein Ordner
+        assert_eq!(root.dir_count, 4); // Users, kevin, docs + Wurzel selbst
+    }
+
+    #[test]
+    fn remove_descendant_of_a_directory_drops_its_whole_subtree() {
+        let mut root = sample_tree();
+
+        // kevin (ID 3) mit allem Inhalt (photo.jpg + docs/notes.txt) löschen
+        let removed = root
+            .remove_descendant(&[2, 3])
+            .expect("kevin sollte gefunden werden");
+        assert_eq!(removed.name, "kevin");
+        assert_eq!(removed.total_size, 2100);
+        assert_eq!(removed.file_count, 2);
+
+        let users = &root.children[0];
+        assert!(users.children.is_empty());
+        assert_eq!(users.total_size, 0);
+        assert_eq!(users.file_count, 0);
+        assert_eq!(users.dir_count, 1); // nur noch Users selbst
+
+        assert_eq!(root.total_size, 5000); // nur noch pagefile.sys
+        assert_eq!(root.file_count, 1);
+        assert_eq!(root.dir_count, 2); // Users + Wurzel
+    }
+
+    #[test]
+    fn remove_descendant_with_unknown_chain_returns_none_and_changes_nothing() {
+        let mut root = sample_tree();
+        let before_total = root.total_size;
+        let before_file_count = root.file_count;
+        let before_dir_count = root.dir_count;
+
+        // ID 999 existiert nirgends im Baum
+        assert!(root.remove_descendant(&[2, 999]).is_none());
+        assert!(root.remove_descendant(&[999]).is_none());
+
+        assert_eq!(root.total_size, before_total);
+        assert_eq!(root.file_count, before_file_count);
+        assert_eq!(root.dir_count, before_dir_count);
+    }
+
+    #[test]
+    fn remove_descendant_with_empty_chain_returns_none() {
+        let mut root = sample_tree();
+        assert!(root.remove_descendant(&[]).is_none());
+        assert_eq!(root.children.len(), 2); // Users und pagefile.sys unangetastet
+    }
+}

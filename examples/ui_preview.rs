@@ -13,8 +13,9 @@
 
 use rustree::tree::{format_size, TreeNode};
 use rustree::treemap::Treemap;
-use slint::{Image, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
+use slint::{Image, Model, Rgb8Pixel, SharedPixelBuffer, SharedString, VecModel};
 use std::cell::{Cell, RefCell};
+use std::collections::HashSet;
 use std::rc::Rc;
 
 slint::include_modules!();
@@ -106,31 +107,65 @@ fn sample_tree() -> TreeNode {
     root
 }
 
-/// Erste Ebene plus die Kinder des größten Ordners, wie nach einem Klick
-fn entries_for(root: &TreeNode) -> Vec<TreeEntry> {
-    let mut entries = Vec::new();
-    for (i, child) in root.children.iter().enumerate() {
-        let expanded = i == 0 && child.is_directory;
-        entries.push(entry(child, 0, expanded));
-        if expanded {
-            for grandchild in &child.children {
-                entries.push(entry(grandchild, 1, false));
+/// Sichtbare Zeilen nach aktuellem Auf-/Zu-Zustand, eine kleine Fassung
+/// von `tree_to_entries` in main.rs; dazu die IDs in derselben Reihenfolge,
+/// um einen Listenindex aus einem Callback einem Knoten zuzuordnen
+fn visible_rows(root: &TreeNode, expanded: &HashSet<u64>) -> (Vec<TreeEntry>, Vec<u64>) {
+    fn walk(node: &TreeNode, depth: i32, expanded: &HashSet<u64>, entries: &mut Vec<TreeEntry>, ids: &mut Vec<u64>) {
+        for child in &node.children {
+            let is_expanded = child.is_directory && expanded.contains(&child.id);
+            entries.push(TreeEntry {
+                name: SharedString::from(&child.name),
+                size: SharedString::from(format_size(child.total_size)),
+                size_bytes: child.total_size as f32,
+                is_directory: child.is_directory,
+                depth,
+                expanded: is_expanded,
+                has_children: child.is_directory && !child.children.is_empty(),
+            });
+            ids.push(child.id);
+            if is_expanded {
+                walk(child, depth + 1, expanded, entries, ids);
             }
         }
     }
-    entries
+    let mut entries = Vec::new();
+    let mut ids = Vec::new();
+    walk(root, 0, expanded, &mut entries, &mut ids);
+    (entries, ids)
 }
 
-fn entry(node: &TreeNode, depth: i32, expanded: bool) -> TreeEntry {
-    TreeEntry {
-        name: SharedString::from(&node.name),
-        size: SharedString::from(format_size(node.total_size)),
-        size_bytes: node.total_size as f32,
-        is_directory: node.is_directory,
-        depth,
-        expanded,
-        has_children: !node.children.is_empty(),
+/// Baut die Liste neu auf - wie `refresh_list` in main.rs mit einem neuen
+/// VecModel, damit die Vorschau denselben Modellwechsel macht wie die App
+/// (das Kontextmenü muss ihn überstehen, siehe context_index in main.slint)
+fn refresh(window: &MainWindow, tree: &TreeNode, expanded: &HashSet<u64>, ids_out: &RefCell<Vec<u64>>, selected_id: Option<u64>) {
+    let (entries, ids) = visible_rows(tree, expanded);
+    let selected_index = selected_id
+        .and_then(|id| ids.iter().position(|&x| x == id))
+        .map_or(-1, |i| i as i32);
+    *ids_out.borrow_mut() = ids;
+    window.set_tree_entries(Rc::new(VecModel::from(entries)).into());
+    window.set_selected_index(selected_index);
+}
+
+/// Name der Zeile an `index`, aus dem Modell, das die GUI gerade zeigt
+fn describe_row(window: &MainWindow, index: i32) -> String {
+    if index < 0 {
+        return "<keine Zeile>".to_string();
     }
+    window
+        .get_tree_entries()
+        .row_data(index as usize)
+        .map(|e| e.name.to_string())
+        .unwrap_or_else(|| format!("<ungültiger Index {index}>"))
+}
+
+/// Statustext für eine Kontextmenü-Aktion, zusätzlich auf stderr - so lässt
+/// sich das Menü ohne Scan prüfen (die Vorschau tut sonst nichts damit)
+fn show_action(window: &MainWindow, action: &str, index: i32) {
+    let text = format!("Kontextmenü: {action}, Zeile {index}: {}", describe_row(window, index));
+    eprintln!("{text}");
+    window.set_status_text(SharedString::from(text));
 }
 
 /// Pfad und Größe zu einer ID-Kette, wie die Hover-Zeile der App
@@ -153,10 +188,89 @@ fn main() -> Result<(), slint::PlatformError> {
     let tree = Rc::new(sample_tree());
     let treemap: Rc<RefCell<Option<Treemap>>> = Rc::new(RefCell::new(None));
 
-    window.set_tree_entries(Rc::new(VecModel::from(entries_for(&tree))).into());
-    window.set_selected_index(1);
+    // Baumzustand wie AppState in main.rs: aufgeklappte Ordner per ID,
+    // dazu die IDs der sichtbaren Zeilen für die Callbacks
+    let expanded: Rc<RefCell<HashSet<u64>>> = Rc::new(RefCell::new({
+        let mut set = HashSet::new();
+        if let Some(first) = tree.children.first() {
+            set.insert(first.id); // erstes Kind schon aufgeklappt, wie bisher
+        }
+        set
+    }));
+    let ids: Rc<RefCell<Vec<u64>>> = Rc::new(RefCell::new(Vec::new()));
+    let selected_id: Rc<Cell<Option<u64>>> = Rc::new(Cell::new(
+        // Markiert wie bisher die VHDX-Datei, das erste Kind des ersten
+        // (größten) Ordners - siehe Treemap-Markierung weiter unten
+        tree.children.first().and_then(|c| c.children.first()).map(|c| c.id),
+    ));
+
+    refresh(&window, &tree, &expanded.borrow(), &ids, selected_id.get());
     window.set_status_text(SharedString::from("Vorschau - Beispieldaten"));
     window.set_scan_target(SharedString::from("C:"));
+
+    // Linksklick auf eine Zeile: Ordner auf-/zuklappen, wie in main.rs
+    {
+        let window_weak = window.as_weak();
+        let tree = tree.clone();
+        let expanded = expanded.clone();
+        let ids = ids.clone();
+        let selected_id = selected_id.clone();
+        window.on_toggle_entry(move |index| {
+            let window = window_weak.unwrap();
+            let id = ids.borrow().get(index as usize).copied();
+            if let Some(id) = id {
+                let mut set = expanded.borrow_mut();
+                if !set.remove(&id) {
+                    set.insert(id);
+                }
+                drop(set);
+                selected_id.set(Some(id));
+            }
+            let expanded_snapshot = expanded.borrow().clone();
+            refresh(&window, &tree, &expanded_snapshot, &ids, selected_id.get());
+            let text = format!("toggle_entry, Zeile {index}: {}", describe_row(&window, index));
+            eprintln!("{text}");
+            window.set_status_text(SharedString::from(text));
+        });
+    }
+
+    // Rechtsklick auf eine Zeile: nur markieren, wie in main.rs
+    {
+        let window_weak = window.as_weak();
+        let tree = tree.clone();
+        let expanded = expanded.clone();
+        let ids = ids.clone();
+        let selected_id = selected_id.clone();
+        window.on_select_entry(move |index| {
+            let window = window_weak.unwrap();
+            let id = ids.borrow().get(index as usize).copied();
+            selected_id.set(id);
+            let expanded_snapshot = expanded.borrow().clone();
+            refresh(&window, &tree, &expanded_snapshot, &ids, selected_id.get());
+            let text = format!("select_entry, Zeile {index}: {}", describe_row(&window, index));
+            eprintln!("{text}");
+            window.set_status_text(SharedString::from(text));
+            window.window().request_redraw();
+        });
+    }
+
+    // Kontextmenü-Aktionen: nur melden, welche Zeile sie getroffen haben
+    {
+        let window_weak = window.as_weak();
+        window.on_open_in_explorer(move |index| show_action(&window_weak.unwrap(), "Im Explorer öffnen", index));
+    }
+    {
+        let window_weak = window.as_weak();
+        window.on_copy_path(move |index| show_action(&window_weak.unwrap(), "Pfad kopieren", index));
+    }
+    {
+        let window_weak = window.as_weak();
+        window.on_zoom_treemap(move |index| show_action(&window_weak.unwrap(), "In Treemap zeigen", index));
+    }
+    {
+        let window_weak = window.as_weak();
+        window.on_delete_entry(move |index| show_action(&window_weak.unwrap(), "Löschen (Papierkorb)", index));
+    }
 
     // Laufwerke für die Startansicht; RUSTREE_PREVIEW_START=1 zeigt sie
     // statt des Scan-Ergebnisses

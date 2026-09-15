@@ -35,6 +35,13 @@ export enum SortColumn { name, size }
 // Hauptfenster
 export component MainWindow inherits Window {
     title: "rustree - Disk Space Analyzer";
+    // Icon für Titelleiste und Alt-Tab. Die Exe-Ressource (build.rs, aus
+    // assets/rustree.ico) deckt nur Explorer und Taskleiste ab - ohne dieses
+    // Fenster-Icon zeigt Windows dort das generische Slint-Symbol. Pfad ist
+    // relativ zu dieser .slint-Datei, slint-build löst ihn beim Kompilieren
+    // auf und bettet das Bild in die Exe ein; 64x64 reicht für die
+    // Titelleiste und ist deutlich kleiner als die 960x960-Vorlage.
+    icon: @image-url("../assets/rustree-icon-64.png");
     min-width: 1024px;
     min-height: 768px;
     background: #1e1e2e;
@@ -62,6 +69,13 @@ export component MainWindow inherits Window {
     in-out property <length> list_viewport_y <=> list.viewport-y;
     out property <length> list_height: list.visible-height;
 
+    // Zeile, für die das Kontextmenü offen ist. Beim Rechtsklick gesetzt,
+    // bevor select_entry() in Rust die Liste neu aufbaut: das Menü darf
+    // nicht am Index einer Zeilen-Instanz hängen, die der ListView beim
+    // Modellwechsel verwirft oder einer anderen Zeile zuweist.
+    in-out property <int> context_index: -1;
+    in-out property <bool> context_has_children: false;
+
     // Treemap: fertiges Bild aus Rust, Pfad der gezeigten Wurzel, Hover-Text
     in-out property <image> treemap_image;
     in-out property <string> treemap_root_text: "";
@@ -81,6 +95,14 @@ export component MainWindow inherits Window {
     callback pick_folder();
     callback rescan();
     callback toggle_entry(int);
+    // Markiert nur die Zeile, ohne sie auf-/zuzuklappen - genutzt vom
+    // Rechtsklick, der vor dem Kontextmenü markiert (wie im Explorer)
+    callback select_entry(int);
+    // Kontextmenü-Aktionen, je mit dem Listenindex der Zeile
+    callback open_in_explorer(int);
+    callback copy_path(int);
+    callback zoom_treemap(int);
+    callback delete_entry(int);
     callback sort_by(SortColumn);
     callback treemap_resized();
     callback treemap_hover(float, float);
@@ -165,10 +187,38 @@ export component MainWindow inherits Window {
                 spacing: 12px;
 
                 // Baumansicht
-                Rectangle {
+                tree_panel := Rectangle {
                     background: #313244;
                     border-radius: 8px;
                     width: 45%;
+
+                    // Ein Kontextmenü für die ganze Liste statt eines pro
+                    // Zeile (siehe context_index). Es liegt hinter der
+                    // VerticalBox, deren Zeilen-TouchAreas jeden Mausdruck
+                    // zuerst bekommen - geöffnet wird es deshalb nur
+                    // programmatisch aus deren pointer-event.
+                    ctx_menu := ContextMenuArea {
+                        Menu {
+                            MenuItem {
+                                title: "Im Explorer öffnen";
+                                activated => { root.open_in_explorer(root.context_index); }
+                            }
+                            MenuItem {
+                                title: "Pfad kopieren";
+                                activated => { root.copy_path(root.context_index); }
+                            }
+                            MenuItem {
+                                title: "In Treemap zeigen";
+                                enabled: root.context_has_children;
+                                activated => { root.zoom_treemap(root.context_index); }
+                            }
+                            MenuSeparator { }
+                            MenuItem {
+                                title: "Löschen (Papierkorb)";
+                                activated => { root.delete_entry(root.context_index); }
+                            }
+                        }
+                    }
 
                     VerticalBox {
                         padding: 8px;
@@ -249,6 +299,23 @@ export component MainWindow inherits Window {
                                 touch := TouchArea {
                                     clicked => {
                                         toggle_entry(index);
+                                    }
+                                    // Rechte Maustaste: Zeile merken, wie im
+                                    // Explorer markieren, dann das Menü an der
+                                    // Mausposition öffnen - umgerechnet in die
+                                    // Koordinaten der ContextMenuArea. clicked
+                                    // oben reagiert nur auf die linke Taste.
+                                    pointer-event(event) => {
+                                        if (event.button == PointerEventButton.right
+                                                && event.kind == PointerEventKind.down) {
+                                            root.context_index = index;
+                                            root.context_has_children = entry.has_children;
+                                            root.select_entry(index);
+                                            ctx_menu.show({
+                                                x: self.absolute-position.x + self.mouse-x - ctx_menu.absolute-position.x,
+                                                y: self.absolute-position.y + self.mouse-y - ctx_menu.absolute-position.y,
+                                            });
+                                        }
                                     }
                                 }
 

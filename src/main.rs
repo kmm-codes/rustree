@@ -163,6 +163,149 @@ fn quote_argument(argument: String) -> String {
     }
 }
 
+/// "C:" allein öffnet der Explorer nicht zuverlässig als Laufwerkswurzel -
+/// ohne den abschließenden Backslash fasst er es teils als relativen Pfad
+/// auf. Alle anderen Pfade (die stets mindestens ein "\<Name>" nach dem
+/// Laufwerksbuchstaben haben, siehe path_of()) bleiben unverändert.
+fn explorer_root_path(path: &str) -> String {
+    if path.len() == 2 && path.as_bytes()[1] == b':' {
+        format!("{}\\", path)
+    } else {
+        path.to_string()
+    }
+}
+
+/// Öffnet den Windows-Explorer für einen Knoten aus dem Baum: einen Ordner
+/// direkt, eine Datei im übergeordneten Ordner mit markierter Datei
+/// (`/select,"<Pfad>"`). Kehrt sofort zurück - `spawn()` wartet nicht auf
+/// den gestarteten Prozess.
+#[cfg(target_os = "windows")]
+fn open_in_explorer(path: &str, is_directory: bool) -> std::io::Result<()> {
+    use std::os::windows::process::CommandExt;
+
+    let mut command = std::process::Command::new("explorer.exe");
+    if is_directory {
+        command.arg(explorer_root_path(path));
+    } else {
+        // explorer.exe erwartet "/select,<Pfad>" als EIN Argument, mit den
+        // Anführungszeichen genau um den Pfad. Rusts übliche Quotierung
+        // würde stattdessen den kompletten String in Anführungszeichen
+        // setzen und so "/select," vom Pfad trennen - raw_arg umgeht Rusts
+        // Quotierung komplett und übergibt die Zeichenkette unverändert.
+        command.raw_arg(format!("/select,\"{}\"", path));
+    }
+    command.spawn()?;
+    Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn open_in_explorer(_path: &str, _is_directory: bool) -> std::io::Result<()> {
+    Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "nur unter Windows verfügbar"))
+}
+
+/// Kopiert einen Pfad in die Zwischenablage. clipboard-win kapselt
+/// OpenClipboard/SetClipboardData; dafür braucht es hier keinen eigenen
+/// unsafe-Code (anders als z.B. SHFileOperationW unten).
+#[cfg(target_os = "windows")]
+fn copy_to_clipboard(text: &str) -> Result<(), String> {
+    clipboard_win::set_clipboard_string(text).map_err(|e| e.to_string())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn copy_to_clipboard(_text: &str) -> Result<(), String> {
+    Err("nur unter Windows verfügbar".to_string())
+}
+
+/// Rückfrage vor dem Löschen, analog zu relaunch_elevated()'s MessageBoxW:
+/// Pfad, Größe (bei Ordnern zusätzlich die Dateizahl), dann Ja/Nein.
+#[cfg(target_os = "windows")]
+fn confirm_delete(path: &str, size: u64, file_count: u64, is_directory: bool) -> bool {
+    use windows::core::HSTRING;
+    use windows::Win32::Foundation::HWND;
+    use windows::Win32::UI::WindowsAndMessaging::{MessageBoxW, IDYES, MB_ICONWARNING, MB_YESNO};
+
+    let details = if is_directory {
+        format!("{}, {} Dateien", format_size(size), file_count)
+    } else {
+        format_size(size)
+    };
+    let question = HSTRING::from(format!(
+        "{}\n\n{}\n\nIn den Papierkorb verschieben?",
+        path, details
+    ));
+    let title = HSTRING::from("rustree");
+    // SAFETY: gültige, nullterminierte Strings; kein Elternfenster nötig,
+    // wie bei relaunch_elevated()
+    let answer = unsafe { MessageBoxW(HWND::default(), &question, &title, MB_YESNO | MB_ICONWARNING) };
+    answer == IDYES
+}
+
+#[cfg(not(target_os = "windows"))]
+fn confirm_delete(_path: &str, _size: u64, _file_count: u64, _is_directory: bool) -> bool {
+    false
+}
+
+/// Ergebnis von move_to_recycle_bin()
+enum DeleteOutcome {
+    /// Rückgabewert 0, fAnyOperationsAborted false
+    Success,
+    /// Rückgabewert 0, aber der Nutzer hat Windows' eigenen Vorgang
+    /// abgebrochen (z.B. über eine Fortschrittsanzeige)
+    Aborted,
+    /// Rückgabewert ungleich 0 - der Fehlercode von SHFileOperationW
+    Failed(i32),
+}
+
+/// Verschiebt Datei oder Ordner per SHFileOperationW in den Papierkorb.
+/// Läuft im Hintergrund-Thread (siehe on_delete_entry) - bei großen Ordnern
+/// dauert der Aufruf spürbar, das darf die UI nicht blockieren.
+#[cfg(target_os = "windows")]
+fn move_to_recycle_bin(path: &str) -> DeleteOutcome {
+    use windows::core::PCWSTR;
+    use windows::Win32::Foundation::{BOOL, HWND};
+    use windows::Win32::UI::Shell::{
+        SHFileOperationW, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FO_DELETE, SHFILEOPSTRUCTW,
+    };
+
+    // pFrom ist eine Liste von Pfaden, jeder einzeln nullterminiert, mit
+    // einer zusätzlichen Null am Ende der gesamten Liste - bei nur einem
+    // Pfad also zwei Nullen hintereinander.
+    let from: Vec<u16> = path.encode_utf16().chain([0u16, 0u16]).collect();
+
+    let mut op = SHFILEOPSTRUCTW {
+        hwnd: HWND::default(),
+        wFunc: FO_DELETE,
+        pFrom: PCWSTR(from.as_ptr()),
+        pTo: PCWSTR::null(),
+        // ALLOWUNDO verschiebt in den Papierkorb statt endgültig zu löschen;
+        // NOCONFIRMATION unterdrückt Windows' eigene Rückfrage - die haben
+        // wir mit confirm_delete() bereits selbst gestellt. Windows' eigene
+        // Fehler-UI bei Problemen lassen wir bewusst an.
+        fFlags: (FOF_ALLOWUNDO.0 | FOF_NOCONFIRMATION.0) as u16,
+        fAnyOperationsAborted: BOOL(0),
+        hNameMappings: std::ptr::null_mut(),
+        lpszProgressTitle: PCWSTR::null(),
+    };
+
+    // SAFETY: `op` und `from` leben bis zum Ende dieses synchronen Aufrufs;
+    // `from` ist wie von pFrom verlangt doppelt nullterminiert. pTo und
+    // lpszProgressTitle bleiben absichtlich null (nicht gebraucht bei FO_DELETE).
+    let result = unsafe { SHFileOperationW(&mut op) };
+
+    if result != 0 {
+        DeleteOutcome::Failed(result)
+    } else if op.fAnyOperationsAborted.as_bool() {
+        DeleteOutcome::Aborted
+    } else {
+        DeleteOutcome::Success
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn move_to_recycle_bin(_path: &str) -> DeleteOutcome {
+    DeleteOutcome::Failed(-1)
+}
+
 /// Zeilenhöhe der Baumansicht, muss zu ui/main.slint passen
 const ROW_HEIGHT: f32 = 28.0;
 
@@ -293,6 +436,17 @@ struct Drive {
     free: u64,
 }
 
+/// Statusmeldung, wenn die Zeile einer Kontextmenü-Aktion nicht mehr im
+/// Baum zu finden ist - etwa weil ein Scan oder ein Löschen den Baum
+/// zwischen Rechtsklick und Menüpunkt verändert hat. Still abzubrechen
+/// wäre irreführend: der Nutzer sähe nicht, dass nichts passiert ist.
+fn context_row_not_found(window: &MainWindow, index: i32) {
+    window.set_status_text(SharedString::from(format!(
+        "Kontextmenü: Zeile {} nicht gefunden - bitte erneut versuchen",
+        index
+    )));
+}
+
 /// Startet die grafische Benutzeroberfläche
 ///
 /// Mit `initial_drive` beginnt der Scan sofort, sonst zeigt die
@@ -409,6 +563,263 @@ fn run_gui(initial_drive: Option<String>) -> Result<(), Box<dyn std::error::Erro
 
         refresh_list(&window, &state);
         update_highlight(&window, &state);
+    });
+
+    // Rechtsklick auf eine Zeile: nur markieren (kein Auf-/Zuklappen), bevor
+    // gleich das Kontextmenü aufgeht - siehe ui/main.slint, touch.pointer-event
+    let gui_select = gui.clone();
+    main_window.on_select_entry(move |index| {
+        let window = gui_select.window.unwrap();
+        let mut state = gui_select.state.lock().unwrap();
+        let AppState {
+            tree,
+            expanded,
+            sort,
+            selected,
+            ..
+        } = &mut *state;
+        let Some(tree) = tree.as_ref() else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(chain) = visible_chain_at(tree, expanded, *sort, index as usize) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        *selected = Some(chain);
+
+        refresh_list(&window, &state);
+        update_highlight(&window, &state);
+        // Gleich öffnet sich das Menü als eigenes Fenster; ohne diese
+        // Aufforderung bliebe die alte Markierung stehen, bis es zugeht
+        window.window().request_redraw();
+    });
+
+    // Kontextmenü "Im Explorer öffnen": Ordner direkt, Datei mit Markierung
+    // im übergeordneten Ordner
+    let gui_explorer = gui.clone();
+    main_window.on_open_in_explorer(move |index| {
+        let window = gui_explorer.window.unwrap();
+        let mut state = gui_explorer.state.lock().unwrap();
+        let AppState {
+            tree,
+            expanded,
+            sort,
+            selected,
+            ..
+        } = &mut *state;
+        let Some(tree_ref) = tree.as_ref() else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(chain) = visible_chain_at(tree_ref, expanded, *sort, index as usize) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(node) = node_at(tree_ref, &chain) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let is_directory = node.is_directory;
+        let Some(path) = path_of(tree_ref, &chain) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        *selected = Some(chain);
+        refresh_list(&window, &state);
+        update_highlight(&window, &state);
+        drop(state);
+
+        match open_in_explorer(&path, is_directory) {
+            Ok(()) => {
+                window.set_status_text(SharedString::from(format!("Explorer geöffnet: {}", path)));
+            }
+            Err(e) => {
+                window.set_status_text(SharedString::from(format!("Explorer ließ sich nicht öffnen: {}", e)));
+            }
+        }
+    });
+
+    // Kontextmenü "Pfad kopieren": voller Pfad in die Zwischenablage
+    let gui_copy = gui.clone();
+    main_window.on_copy_path(move |index| {
+        let window = gui_copy.window.unwrap();
+        let mut state = gui_copy.state.lock().unwrap();
+        let AppState {
+            tree,
+            expanded,
+            sort,
+            selected,
+            ..
+        } = &mut *state;
+        let Some(tree_ref) = tree.as_ref() else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(chain) = visible_chain_at(tree_ref, expanded, *sort, index as usize) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(path) = path_of(tree_ref, &chain) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        *selected = Some(chain);
+        refresh_list(&window, &state);
+        update_highlight(&window, &state);
+        drop(state);
+
+        match copy_to_clipboard(&path) {
+            Ok(()) => {
+                window.set_status_text(SharedString::from(format!("Pfad kopiert: {}", path)));
+            }
+            Err(e) => {
+                window.set_status_text(SharedString::from(format!("Zwischenablage nicht verfügbar: {}", e)));
+            }
+        }
+    });
+
+    // Kontextmenü "In Treemap zeigen": nur für Ordner mit Kindern (per
+    // enabled: entry.has_children in ui/main.slint); hier zur Sicherheit
+    // noch einmal geprüft
+    let gui_zoom = gui.clone();
+    main_window.on_zoom_treemap(move |index| {
+        let window = gui_zoom.window.unwrap();
+        let mut state = gui_zoom.state.lock().unwrap();
+        let AppState {
+            tree,
+            expanded,
+            sort,
+            selected,
+            ..
+        } = &mut *state;
+        let Some(tree_ref) = tree.as_ref() else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(chain) = visible_chain_at(tree_ref, expanded, *sort, index as usize) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(node) = node_at(tree_ref, &chain) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        if !node.is_directory || node.children.is_empty() {
+            return;
+        }
+        *selected = Some(chain.clone());
+        state.treemap_root = chain;
+        refresh_list(&window, &state);
+        update_highlight(&window, &state);
+        show_treemap_root(&window, &state);
+        drop(state);
+        schedule_treemap_render(&gui_zoom);
+    });
+
+    // Kontextmenü "Löschen (Papierkorb)": eigene Rückfrage, dann
+    // SHFileOperationW im Hintergrund-Thread (nicht im UI-Thread blockieren -
+    // bei großen Ordnern dauert das Verschieben spürbar)
+    let gui_delete = gui.clone();
+    main_window.on_delete_entry(move |index| {
+        let window = gui_delete.window.unwrap();
+        let mut state = gui_delete.state.lock().unwrap();
+        let AppState {
+            tree,
+            expanded,
+            sort,
+            selected,
+            ..
+        } = &mut *state;
+        let Some(tree_ref) = tree.as_ref() else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let Some(chain) = visible_chain_at(tree_ref, expanded, *sort, index as usize) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        if chain.is_empty() {
+            // Die Wurzelzeile steht zwar gar nicht in der Liste (visit_visible
+            // beginnt erst bei ihren Kindern), zur Sicherheit trotzdem: die
+            // Scan-Wurzel selbst löschen wir nicht.
+            return;
+        }
+        let Some(node) = node_at(tree_ref, &chain) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        let is_directory = node.is_directory;
+        let size = node.total_size;
+        let file_count = node.file_count;
+        let Some(path) = path_of(tree_ref, &chain) else {
+            context_row_not_found(&window, index);
+            return;
+        };
+        *selected = Some(chain.clone());
+        refresh_list(&window, &state);
+        update_highlight(&window, &state);
+        drop(state);
+
+        if !confirm_delete(&path, size, file_count, is_directory) {
+            window.set_status_text(SharedString::from("Löschen abgebrochen"));
+            return;
+        }
+        window.set_status_text(SharedString::from(format!("Verschiebe {} in den Papierkorb...", path)));
+
+        let gui_thread = gui_delete.clone();
+        let window_weak = window.as_weak();
+        let path_for_message = path.clone();
+        std::thread::spawn(move || {
+            let outcome = move_to_recycle_bin(&path);
+
+            let _ = slint::invoke_from_event_loop(move || {
+                let Some(window) = window_weak.upgrade() else {
+                    return;
+                };
+                match outcome {
+                    DeleteOutcome::Success => {
+                        let mut state = gui_thread.state.lock().unwrap();
+                        let removed_size = state
+                            .tree
+                            .as_mut()
+                            .and_then(|tree| tree.remove_descendant(&chain))
+                            .map(|removed| removed.total_size);
+                        state.selected = None;
+                        if state.treemap_root.starts_with(chain.as_slice()) {
+                            state.treemap_root.truncate(chain.len() - 1);
+                        }
+                        refresh_list(&window, &state);
+                        update_highlight(&window, &state);
+                        show_treemap_root(&window, &state);
+                        drop(state);
+                        schedule_treemap_render(&gui_thread);
+
+                        // Kein Treffer heißt: der Baum wurde inzwischen ersetzt
+                        // (Neu scannen während des Verschiebens) - dann gibt es
+                        // nichts abzuziehen, der neue Scan kennt die Löschung
+                        let status = match removed_size {
+                            Some(size) => format!(
+                                "{} in den Papierkorb verschoben ({})",
+                                path_for_message,
+                                format_size(size)
+                            ),
+                            None => format!("{} in den Papierkorb verschoben", path_for_message),
+                        };
+                        window.set_status_text(SharedString::from(status));
+                    }
+                    DeleteOutcome::Aborted => {
+                        window.set_status_text(SharedString::from("Löschen abgebrochen"));
+                    }
+                    DeleteOutcome::Failed(code) => {
+                        window.set_status_text(SharedString::from(format!(
+                            "Löschen fehlgeschlagen (Code 0x{:X}): {} - Neu scannen empfohlen",
+                            code, path_for_message
+                        )));
+                    }
+                }
+            });
+        });
     });
 
     // Klick auf einen Spaltenkopf: Spalte wechseln oder Richtung umdrehen
